@@ -12,11 +12,12 @@ import pytest
 from PIL import Image
 from auction.app import create_app, connect, verify_telegram
 from auction.worker import tick
+from auction.i18n import translate
 
 TOKEN = '123456:fake-test-token'
 
 
-def signed(user_id, name='Друг', username='friend', date=None):
+def signed(user_id, name=translate('fixture_signed_01'), username='friend', date=None):
     data = {'auth_date': str(int(time.time() if date is None else date)), 'query_id': 'test',
             'user': json.dumps({'id': user_id, 'first_name': name, 'username': username}, ensure_ascii=False, separators=(',', ':'))}
     check = '\n'.join(f'{k}={v}' for k, v in sorted(data.items()))
@@ -41,13 +42,13 @@ def client(app):
 
 
 def create_lot(client, start=0, step=50):
-    res = client.post('/api/admin/lots', headers=auth(1), data={'title': 'Бокалы', 'description': 'Описание', 'condition': 'Хорошее', 'start_price': str(start), 'step': str(step)})
+    res = client.post('/api/admin/lots', headers=auth(1), data={'title': translate('fixture_create_lot_01'), 'description': translate('fixture_create_lot_02'), 'condition': translate('fixture_create_lot_03'), 'start_price': str(start), 'step': str(step)})
     assert res.status_code == 201, res.data
     return res.json['lot']['id']
 
 
 def approve(client, uid):
-    assert client.post('/api/application', headers=auth(uid), json={'given_name':'Анна', 'family_name':'Примерова'}).status_code == 200
+    assert client.post('/api/application', headers=auth(uid), json={'given_name':translate('fixture_approve_01'), 'family_name':translate('fixture_approve_02')}).status_code == 200
     assert client.post(f'/api/admin/users/{uid}', headers=auth(1), json={'status': 'approved'}).status_code == 200
 
 
@@ -87,7 +88,7 @@ def test_one_signed_user_cannot_exhaust_another_users_write_limit(app, client, m
 def test_trial_application_flood_is_limited_per_cloudflare_client(app, client, monkeypatch):
     monkeypatch.setattr('auction.app.time.monotonic', lambda: 6000)
     app.config['TRIAL'] = True
-    payload = {'given_name':'Анна', 'family_name':'Примерова'}
+    payload = {'given_name':translate('fixture_approve_01'), 'family_name':translate('fixture_approve_02')}
     def headers(uid, ip):
         return {**auth(uid), 'CF-Connecting-IP':ip}
     assert all(client.post('/api/application', headers=headers(uid,'203.0.113.8'), json=payload).status_code == 200 for uid in range(2,22))
@@ -142,19 +143,19 @@ def test_close_is_strict_and_no_late_bid(app, client):
 def test_photo_is_reencoded_and_rejects_fake_image(app, client):
     image = Image.new('RGB', (15, 15), 'red')
     output = io.BytesIO(); image.save(output, 'JPEG', exif=b'Exif\x00\x00junk'); output.seek(0)
-    res = client.post('/api/admin/lots', headers=auth(1), data={'title':'Фото','start_price':'0','step':'1','photos':(output,'input.jpg')}, content_type='multipart/form-data')
+    res = client.post('/api/admin/lots', headers=auth(1), data={'title':translate('fixture_test_photo_is_reencoded_and_rejects_fake_image_01'),'start_price':'0','step':'1','photos':(output,'input.jpg')}, content_type='multipart/form-data')
     assert res.status_code == 201
     photo = client.get(res.json['lot']['photos'][0])
     assert photo.status_code == 200
     assert b'Exif\x00\x00junk' not in photo.data
-    res = client.post('/api/admin/lots', headers=auth(1), data={'title':'Фото','start_price':'0','step':'1','photos':(io.BytesIO(b'bad'),'x.jpg')}, content_type='multipart/form-data')
+    res = client.post('/api/admin/lots', headers=auth(1), data={'title':translate('fixture_test_photo_is_reencoded_and_rejects_fake_image_01'),'start_price':'0','step':'1','photos':(io.BytesIO(b'bad'),'x.jpg')}, content_type='multipart/form-data')
     assert res.status_code == 400
 
 
 def test_large_valid_photo_is_accepted_with_form_limits(client):
     image = Image.frombytes('RGB', (600, 600), os.urandom(600 * 600 * 3))
     output = io.BytesIO(); image.save(output, 'JPEG', quality=90); output.seek(0)
-    res = client.post('/api/admin/lots', headers=auth(1), data={'title':'Фото', 'start_price':'0', 'step':'1', 'photos':(output,'input.jpg')}, content_type='multipart/form-data')
+    res = client.post('/api/admin/lots', headers=auth(1), data={'title':translate('fixture_test_photo_is_reencoded_and_rejects_fake_image_01'), 'start_price':'0', 'step':'1', 'photos':(output,'input.jpg')}, content_type='multipart/form-data')
     assert res.status_code == 201
 
 
@@ -172,7 +173,7 @@ def test_digest_and_reminder_no_duplicate(app, client):
     assert len(messages) == 1 and messages[0][0] == 2
     app.config['END'] = now + 1800
     tick(app, now+20, sender);tick(app, now+30, sender)
-    assert sum('меньше часа' in message for _,message in messages) == 2
+    assert sum(translate('fixture_test_digest_and_reminder_no_duplicate_01') in message for _,message in messages) == 2
 
 
 def test_retention_removes_data_and_files(app, client):
@@ -190,7 +191,7 @@ def test_retention_removes_data_and_files(app, client):
 
 def test_edit_only_before_first_bid_and_fallback(app, client, monkeypatch):
     lot = create_lot(client)
-    data = {'title':'Другая вещь', 'description':'Описание', 'condition':'Новое', 'start_price':0, 'step':50}
+    data = {'title':translate('fixture_test_edit_only_before_first_bid_and_fallback_01'), 'description':translate('fixture_create_lot_02'), 'condition':translate('fixture_test_edit_only_before_first_bid_and_fallback_02'), 'start_price':0, 'step':50}
     assert client.post(f'/api/admin/lots/{lot}/edit', headers=auth(2), json=data).status_code == 403
     assert client.post(f'/api/admin/lots/{lot}/edit', headers=auth(1), json=data).status_code == 200
     approve(client,2); approve(client,3)
@@ -218,7 +219,7 @@ def test_last_hour_outbid_sends_without_daily_delay(app, client):
     assert bid(client,lot,3,50,0).status_code == 200
     sent=[]
     tick(app, time.time(), lambda token,uid,message: sent.append((uid,message)) or True)
-    assert any(uid == 2 and 'перебили' in message for uid,message in sent)
+    assert any(uid == 2 and translate('fixture_test_last_hour_outbid_sends_without_daily_delay_01') in message for uid,message in sent)
 
 
 def test_public_access_and_explicit_participation_subscription(client):
@@ -231,15 +232,15 @@ def test_public_access_and_explicit_participation_subscription(client):
 def test_application_requires_private_names_and_admin_only_visibility(client):
     lot = create_lot(client)
     assert client.post('/api/application', headers=auth(2), json={}).status_code == 400
-    assert client.post('/api/application', headers=auth(2), json={'given_name':'Анна', 'family_name':'  '}).status_code == 400
-    assert client.post('/api/application', headers=auth(2), json={'given_name':' Анна ', 'family_name':' Иванова '}).json['status'] == 'pending'
+    assert client.post('/api/application', headers=auth(2), json={'given_name':translate('fixture_approve_01'), 'family_name':'  '}).status_code == 400
+    assert client.post('/api/application', headers=auth(2), json={'given_name':translate('fixture_test_application_requires_private_names_and_admin_only_visibility_01'), 'family_name':translate('fixture_test_application_requires_private_names_and_admin_only_visibility_02')}).json['status'] == 'pending'
     assert client.post('/api/admin/users/2', headers=auth(1), json={'status':'approved'}).status_code == 200
     assert bid(client, lot, 2, 0, None).status_code == 200
     owner = client.get('/api/admin/applications', headers=auth(1)).json['users'][0]
-    assert (owner['applicant_given_name'], owner['applicant_family_name']) == ('Анна', 'Иванова')
-    assert client.get(f'/api/admin/lots/{lot}', headers=auth(1)).json['candidates'][0]['applicant_family_name'] == 'Иванова'
+    assert (owner['applicant_given_name'], owner['applicant_family_name']) == (translate('fixture_approve_01'), translate('fixture_test_application_requires_private_names_and_admin_only_visibility_03'))
+    assert client.get(f'/api/admin/lots/{lot}', headers=auth(1)).json['candidates'][0]['applicant_family_name'] == translate('fixture_test_application_requires_private_names_and_admin_only_visibility_03')
     for path, headers in [('/api/lots', {}), (f'/api/lots/{lot}', auth(3)), ('/api/me', auth(3)), ('/api/my-bids', auth(3))]:
-        assert 'Иванова' not in client.get(path, headers=headers).get_data(as_text=True)
+        assert translate('fixture_test_application_requires_private_names_and_admin_only_visibility_03') not in client.get(path, headers=headers).get_data(as_text=True)
     assert client.get('/api/admin/applications', headers=auth(3)).status_code == 403
     assert client.get(f'/api/admin/lots/{lot}', headers=auth(3)).status_code == 403
 
@@ -248,7 +249,7 @@ def test_existing_database_migrates_without_losing_applications(tmp_path):
     db_path = str(tmp_path/'old.sqlite3')
     db = connect(db_path)
     db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, first_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new')")
-    db.execute("INSERT INTO users VALUES (2,'old','Друг','pending')")
+    db.execute("INSERT INTO users VALUES (2,'old','Friend','pending')")
     db.close()
     app = create_app({'TESTING':True,'DB':db_path,'UPLOADS':str(tmp_path/'photos'),'BOT_TOKEN':TOKEN,'ADMIN_ID':'1'})
     client = app.test_client()
@@ -288,7 +289,7 @@ def test_trial_mode_is_explicit_and_does_not_enable_demo(app, client):
 
 def test_product_bid_history_is_complete_and_only_for_admin(client):
     lot = create_lot(client)
-    for uid, first, last in [(2, 'Анна', 'Примерова'), (3, 'Михаил', 'Тестов')]:
+    for uid, first, last in [(2, translate('fixture_approve_01'), translate('fixture_approve_02')), (3, translate('fixture_test_product_bid_history_is_complete_and_only_for_admin_01'), translate('fixture_test_product_bid_history_is_complete_and_only_for_admin_02'))]:
         assert client.post('/api/application', headers=auth(uid), json={'given_name':first,'family_name':last}).status_code == 200
         assert client.post(f'/api/admin/users/{uid}', headers=auth(1), json={'status':'approved'}).status_code == 200
     assert bid(client,lot,2,0,None).status_code == 200
@@ -296,11 +297,11 @@ def test_product_bid_history_is_complete_and_only_for_admin(client):
     assert bid(client,lot,2,100,50).status_code == 200
     history=client.get(f'/api/admin/lots/{lot}',headers=auth(1)).json['bids']
     assert [(b['amount'],b['applicant_given_name'],b['applicant_family_name']) for b in history] == [
-        (100,'Анна','Примерова'), (50,'Михаил','Тестов'), (0,'Анна','Примерова')]
+        (100,translate('fixture_approve_01'),translate('fixture_approve_02')), (50,translate('fixture_test_product_bid_history_is_complete_and_only_for_admin_01'),translate('fixture_test_product_bid_history_is_complete_and_only_for_admin_02')), (0,translate('fixture_approve_01'),translate('fixture_approve_02'))]
     assert all(isinstance(b['created'],(int,float)) for b in history)
     assert client.get(f'/api/admin/lots/{lot}').status_code == 401
     assert client.get(f'/api/admin/lots/{lot}',headers=auth(2)).status_code == 403
     assert client.get(f'/api/admin/lots/{lot}',headers=auth(3)).status_code == 403
     for headers in ({}, auth(2), auth(3)):
         public=client.get(f'/api/lots/{lot}',headers=headers).get_data(as_text=True)
-        assert 'Примерова' not in public and 'Тестов' not in public and 'user_id' not in public
+        assert translate('fixture_approve_02') not in public and translate('fixture_test_product_bid_history_is_complete_and_only_for_admin_02') not in public and 'user_id' not in public

@@ -18,9 +18,10 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, abort, g, jsonify, request, send_from_directory
+from flask import Flask, abort, g, jsonify, render_template_string, request, send_from_directory
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pillow_heif import register_heif_opener
+from auction.i18n import translate
 
 ROOT = Path(__file__).resolve().parent.parent
 END = datetime(2026, 12, 12, 16, 59, tzinfo=timezone.utc).timestamp()
@@ -173,9 +174,9 @@ def create_app(config=None):
     @app.before_request
     def throttle():
         if app.config['DEMO'] and (request.host.split(':')[0] not in ('localhost', '127.0.0.1') or request.headers.get('X-Forwarded-For') or request.headers.get('Forwarded')):
-            abort(403, 'Деморежим доступен только на этом компьютере.')
+            abort(403, translate('api_create_app_throttle_01'))
         if time.time() >= app.config['DELETE_AFTER'] and (request.path.startswith('/api/') or request.path.startswith('/photos/')):
-            abort(410, 'Срок хранения данных аукциона завершён.')
+            abort(410, translate('api_create_app_throttle_02'))
         if request.path.startswith('/api/'):
             g.verified_identity = identity()
             user = g.verified_identity
@@ -187,19 +188,19 @@ def create_app(config=None):
                 subject = cloudflare_client_ip() or request.remote_addr or 'unknown'
                 scope, limit = ('guest-write', 60) if write else ('guest-read', 300)
             if not allow_rate(scope, subject, limit):
-                abort(429, 'Слишком много запросов. Попробуйте позже.')
+                abort(429, translate('api_create_app_throttle_03'))
             # A single connection should not create an unbounded stream of applications.
             # It never shares a bucket with administrator actions or ordinary browsing.
             if request.path == '/api/application' and write and user:
                 ip = cloudflare_client_ip()
                 if not allow_rate('application-user', subject, 5) or (ip and not allow_rate('application-ip', ip, 20)):
-                    abort(429, 'Слишком много заявок. Попробуйте позже.')
+                    abort(429, translate('api_create_app_throttle_04'))
 
     def identity():
         if app.config['DEMO']:
             # Explicit demo mode only, must never be exposed on a public host.
             role = request.headers.get('X-Demo-User', 'guest')
-            sample = {'admin': (90001, 'organizer', 'Организатор'), 'friend': (90002, 'friend', 'Аня'), 'other': (90003, 'another_friend', 'Миша')}
+            sample = {'admin': (90001, 'organizer', translate('api_create_app_identity_01')), 'friend': (90002, 'friend', translate('api_create_app_identity_02')), 'other': (90003, 'another_friend', translate('api_create_app_identity_03'))}
             if role in sample:
                 uid, username, name = sample[role]
                 return {'id': uid, 'username': username, 'first_name': name}
@@ -209,7 +210,7 @@ def create_app(config=None):
         user = g.get('verified_identity')
         if user is None:
             if required:
-                abort(401, 'Откройте приложение в Telegram.')
+                abort(401, translate('api_create_app_current_user_01'))
             return None
         db = database()
         row = db.execute('SELECT * FROM users WHERE id=?', (user['id'],)).fetchone()
@@ -227,7 +228,7 @@ def create_app(config=None):
             user = current_user(True)
             expected = '90001' if app.config['DEMO'] else str(app.config['ADMIN_ID'])
             if not expected or str(user['id']) != expected:
-                abort(403, 'Нет доступа.')
+                abort(403, translate('api_create_app_admin_required_wrapper_01'))
             return fn(*args, **kwargs)
         return wrapper
 
@@ -236,16 +237,16 @@ def create_app(config=None):
 
     def active_lot(lot_id):
         if lot_id > 2**63 - 1:
-            abort(404, 'Лот не найден.')
+            abort(404, translate('api_create_app_active_lot_01'))
         lot = database().execute('SELECT * FROM lots WHERE id=?', (lot_id,)).fetchone()
         if not lot:
-            abort(404, 'Лот не найден.')
+            abort(404, translate('api_create_app_active_lot_01'))
         return lot
 
     def json_body():
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
-            abort(400, 'Некорректный запрос.')
+            abort(400, translate('api_create_app_json_body_01'))
         return data
 
     def lot_view(lot, user=None):
@@ -259,7 +260,8 @@ def create_app(config=None):
 
     @app.get('/')
     def index():
-        return send_from_directory(ROOT / 'static', 'index.html')
+        template = (ROOT / 'static' / 'index.html').read_text(encoding='utf-8')
+        return render_template_string(template, translate=translate)
 
     @app.get('/assets/<path:filename>')
     def assets(filename):
@@ -295,10 +297,10 @@ def create_app(config=None):
             given = data.get('given_name')
             family = data.get('family_name')
             if not isinstance(given, str) or not isinstance(family, str):
-                abort(400, 'Укажите имя и фамилию.')
+                abort(400, translate('api_create_app_application_01'))
             given, family = given.strip(), family.strip()
             if any(len(name) > 100 or not any(char.isalpha() for char in name) or any(ord(char) < 32 or ord(char) == 127 for char in name) for name in (given, family)):
-                abort(400, 'Укажите имя и фамилию: до 100 символов в каждом поле.')
+                abort(400, translate('api_create_app_application_02'))
             database().execute("UPDATE users SET status='pending', applicant_given_name=?, applicant_family_name=? WHERE id=? AND status='new'", (given, family, user['id']))
         return jsonify(status=database().execute('SELECT status FROM users WHERE id=?', (user['id'],)).fetchone()['status'])
 
@@ -306,31 +308,31 @@ def create_app(config=None):
     def bid(lot_id):
         user = current_user(True)
         if user['status'] != 'approved':
-            abort(403, 'Для ставки сначала нужна подтверждённая заявка.')
+            abort(403, translate('api_create_app_bid_01'))
         payload = json_body()
         amount = payload.get('amount')
         expected = payload.get('expected_price')
         if type(amount) is not int or amount < 0 or amount > 100_000_000 or (expected is not None and type(expected) is not int):
-            abort(400, 'Введите корректную сумму в рублях.')
+            abort(400, translate('api_create_app_bid_02'))
         db = database()
         db.execute('BEGIN IMMEDIATE')
         try:
             current = db.execute('SELECT status FROM users WHERE id=?', (user['id'],)).fetchone()
             if not current or current['status'] != 'approved':
-                abort(403, 'Для ставки сначала нужна подтверждённая заявка.')
+                abort(403, translate('api_create_app_bid_01'))
             lot = active_lot(lot_id)
             if lot['status'] != 'active' or time.time() >= app.config['END']:
-                abort(409, 'Торги по этому лоту завершены.')
+                abort(409, translate('api_create_app_bid_03'))
             lead = db.execute('SELECT amount,user_id FROM bids WHERE lot_id=? ORDER BY amount DESC,id DESC LIMIT 1', (lot_id,)).fetchone()
             price = lead['amount'] if lead else None
             if expected != price:
-                abort(409, 'Цена изменилась. Проверьте её и подтвердите ставку заново.')
+                abort(409, translate('api_create_app_bid_04'))
             if lead and lead['user_id'] == user['id']:
-                abort(409, 'Вы уже лидируете в этом лоте.')
+                abort(409, translate('api_create_app_bid_05'))
             base = price if lead else lot['start_price']
             minimum = base + lot['step'] if lead else base
             if amount < minimum or (amount - base) % lot['step'] != 0:
-                abort(400, 'Сумма должна учитывать начальную цену и шаг ставки.')
+                abort(400, translate('api_create_app_bid_06'))
             now = time.time()
             db.execute('INSERT INTO bids(lot_id,user_id,amount,created) VALUES(?,?,?,?)', (lot_id,user['id'],amount,now))
             db.execute('INSERT INTO subscriptions(lot_id,user_id,participation,watching) VALUES(?,?,1,0) ON CONFLICT(lot_id,user_id) DO UPDATE SET participation=1', (lot_id,user['id']))
@@ -354,10 +356,10 @@ def create_app(config=None):
         kind = data.get('kind')
         enabled = data.get('enabled')
         if kind not in ('watching', 'participation') or type(enabled) is not bool:
-            abort(400, 'Некорректная настройка.')
+            abort(400, translate('api_create_app_subscription_01'))
         db = database()
         if kind == 'participation' and enabled and not db.execute('SELECT 1 FROM bids WHERE lot_id=? AND user_id=?', (lot_id, user['id'])).fetchone():
-            abort(400, 'Уведомления об участии доступны после ставки.')
+            abort(400, translate('api_create_app_subscription_02'))
         db.execute('INSERT OR IGNORE INTO subscriptions(lot_id,user_id) VALUES(?,?)', (lot_id,user['id']))
         db.execute('UPDATE subscriptions SET ' + kind + '=? WHERE lot_id=? AND user_id=?', (int(enabled), lot_id, user['id']))
         return jsonify(ok=True)
@@ -379,20 +381,20 @@ def create_app(config=None):
     @admin_required
     def admin_user(user_id):
         if user_id > 2**63 - 1:
-            abort(404, 'Заявка не найдена.')
+            abort(404, translate('api_create_app_admin_user_01'))
         status = json_body().get('status')
         if status not in ('approved','rejected'):
-            abort(400, 'Неизвестное решение.')
+            abort(400, translate('api_create_app_admin_user_02'))
         result = database().execute('UPDATE users SET status=? WHERE id=?', (status,user_id))
         if result.rowcount == 0:
-            abort(404, 'Заявка не найдена.')
+            abort(404, translate('api_create_app_admin_user_01'))
         return jsonify(ok=True)
 
     @app.post('/api/admin/lots')
     @admin_required
     def create_lot():
         if time.time() >= app.config['END']:
-            abort(409, 'Торги уже завершены.')
+            abort(409, translate('api_create_app_create_lot_01'))
         title = request.form.get('title','').strip()
         description = request.form.get('description','').strip()
         condition = request.form.get('condition','').strip()
@@ -400,12 +402,12 @@ def create_app(config=None):
             start = int(request.form.get('start_price',''))
             step = int(request.form.get('step',''))
         except ValueError:
-            abort(400, 'Введите цену и шаг в целых рублях.')
+            abort(400, translate('api_create_app_create_lot_02'))
         if not title or len(title)>120 or len(description)>3000 or len(condition)>120 or start < 0 or start > 100_000_000 or step < 1 or step > 100_000_000:
-            abort(400, 'Проверьте название, цену и шаг ставки.')
+            abort(400, translate('api_create_app_create_lot_03'))
         images = request.files.getlist('photos')
         if len(images) > 6:
-            abort(400, 'Можно добавить не более шести фотографий.')
+            abort(400, translate('api_create_app_create_lot_04'))
         prepared = []
         for uploaded in images:
             if not uploaded.filename:
@@ -413,7 +415,7 @@ def create_app(config=None):
             try:
                 img = Image.open(uploaded.stream)
                 if img.format not in ('JPEG', 'PNG', 'WEBP', 'HEIF'):
-                    abort(400, 'Поддерживаются JPEG, PNG, WebP и HEIC/HEIF.')
+                    abort(400, translate('api_create_app_create_lot_05'))
                 img = ImageOps.exif_transpose(img)
                 img.thumbnail((1800, 1800))
                 if img.mode != 'RGB':
@@ -422,7 +424,7 @@ def create_app(config=None):
                 img.save(buffer, 'JPEG', quality=85, optimize=True)
                 prepared.append(buffer.getvalue())
             except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
-                abort(400, 'Не удалось прочитать фотографию.')
+                abort(400, translate('api_create_app_create_lot_06'))
         db = database()
         paths = []
         try:
@@ -456,15 +458,15 @@ def create_app(config=None):
             db.execute('UPDATE lots SET fulfillment=? WHERE id=?', (action,lot_id))
         elif action == 'refuse':
             if time.time() < app.config['END'] or lot['status'] != 'active':
-                abort(409, 'Результаты ещё не определены.')
+                abort(409, translate('api_create_app_admin_lot_01'))
             refused = json.loads(lot['refused'])
             candidates = candidates_for(db,lot_id,refused)
             if not candidates:
-                abort(409, 'Больше нет участников.')
+                abort(409, translate('api_create_app_admin_lot_02'))
             refused.append(candidates[0]['id'])
             db.execute('UPDATE lots SET refused=? WHERE id=?', (json.dumps(refused),lot_id))
         else:
-            abort(400, 'Неизвестное действие.')
+            abort(400, translate('api_create_app_admin_lot_03'))
         return jsonify(ok=True)
 
     @app.post('/api/admin/lots/<int:lot_id>/edit')
@@ -476,16 +478,16 @@ def create_app(config=None):
         condition = data.get('condition', '')
         start, step = data.get('start_price'), data.get('step')
         if not all(isinstance(x, str) for x in (title, description, condition)):
-            abort(400, 'Проверьте описание вещи.')
+            abort(400, translate('api_create_app_edit_lot_01'))
         title, description, condition = title.strip(), description.strip(), condition.strip()
         if not title or len(title)>120 or len(description)>3000 or len(condition)>120 or type(start) is not int or type(step) is not int or not 0 <= start <= 100_000_000 or not 1 <= step <= 100_000_000:
-            abort(400, 'Проверьте название, цену и шаг ставки.')
+            abort(400, translate('api_create_app_create_lot_03'))
         db = database()
         db.execute('BEGIN IMMEDIATE')
         try:
             lot = active_lot(lot_id)
             if lot['status'] != 'active' or time.time() >= app.config['END'] or db.execute('SELECT 1 FROM bids WHERE lot_id=? LIMIT 1', (lot_id,)).fetchone():
-                abort(409, 'Редактирование доступно до первой ставки и завершения торгов.')
+                abort(409, translate('api_create_app_edit_lot_02'))
             db.execute('UPDATE lots SET title=?,description=?,condition=?,start_price=?,step=? WHERE id=?', (title,description,condition,start,step,lot_id))
             db.commit()
         except Exception:
@@ -505,13 +507,13 @@ def create_app(config=None):
     def notify_candidate(lot_id):
         lot = active_lot(lot_id)
         if time.time() < app.config['END'] or lot['status'] != 'active':
-            abort(409, 'Результаты ещё не определены.')
+            abort(409, translate('api_create_app_admin_lot_01'))
         candidates = candidates_for(database(), lot_id, json.loads(lot['refused']))
         if not candidates or not json.loads(lot['refused']):
-            abort(409, 'Следующий участник пока не выбран.')
+            abort(409, translate('api_create_app_notify_candidate_01'))
         from auction.worker import send_message
-        if not send_message(app.config['BOT_TOKEN'], candidates[0]['id'], 'Организатор предлагает вам вещь «' + lot['title'] + '». Свяжитесь с ним, чтобы обсудить получение.'):
-            abort(409, 'Не удалось отправить сообщение. Свяжитесь с участником лично.')
+        if not send_message(app.config['BOT_TOKEN'], candidates[0]['id'], translate('api_create_app_notify_candidate_02') + lot['title'] + translate('api_create_app_notify_candidate_03')):
+            abort(409, translate('api_create_app_notify_candidate_04'))
         return jsonify(ok=True)
 
     return app

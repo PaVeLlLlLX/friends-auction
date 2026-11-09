@@ -2,6 +2,7 @@
 import json
 import urllib.error
 import urllib.request
+from auction.i18n import translate
 
 
 class TelegramError(Exception):
@@ -16,7 +17,7 @@ def call(token, method, payload=None, timeout=15):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.load(response)
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise TelegramError('Не удалось связаться с Telegram API.') from None
+        raise TelegramError(translate('telegram_call_01')) from None
     if not isinstance(result, dict) or not result.get('ok'):
-        raise TelegramError('Telegram API отклонил запрос.')
+        raise TelegramError(translate('telegram_call_02'))
     return result.get('result')

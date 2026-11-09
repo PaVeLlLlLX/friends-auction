@@ -8,6 +8,7 @@ from pathlib import Path
 
 from auction.app import create_app, connect
 from auction.telegram import call, TelegramError
+from auction.i18n import translate
 
 TZ = timezone(timedelta(hours=7))
 
@@ -47,8 +48,8 @@ def poll_start_messages(app, app_url, send=call):
             if chat.get('type') == 'private' and type(chat.get('id')) is int and chat.get('id') == person.get('id') and (text == '/start' or text.startswith('/start ')):
                 try:
                     send(app.config['BOT_TOKEN'], 'sendMessage', {
-                        'chat_id': chat['id'], 'text':'Откройте аукцион кнопкой ниже.',
-                        'reply_markup':{'inline_keyboard':[[{'text':'Открыть аукцион','web_app':{'url':app_url}}]]},
+                        'chat_id': chat['id'], 'text':translate('notification_poll_start_messages_01'),
+                        'reply_markup':{'inline_keyboard':[[{'text':translate('notification_poll_start_messages_02'),'web_app':{'url':app_url}}]]},
                     })
                 except TelegramError:
                     logging.warning('Could not reply to a Telegram start request')
@@ -92,14 +93,14 @@ def tick(app, now=None, send=send_message):
                 lines = []
                 for lot_id, title in lots:
                     lead = db.execute('SELECT amount,user_id FROM bids WHERE lot_id=? ORDER BY amount DESC,id DESC LIMIT 1', (lot_id,)).fetchone()
-                    current = f'{lead["amount"]} ₽' if lead else 'нет ставок'
+                    current = f'{lead["amount"]} ₽' if lead else translate('notification_tick_01')
                     own = db.execute('SELECT 1 FROM bids WHERE lot_id=? AND user_id=? LIMIT 1', (lot_id,user[0])).fetchone()
-                    status = (' · вы лидируете' if lead and lead['user_id']==user[0] else ' · вашу ставку перебили') if own else ''
+                    status = (translate('notification_tick_02') if lead and lead['user_id']==user[0] else translate('notification_tick_03')) if own else ''
                     lines.append(f'• {title}: {current}{status}')
                 body = '\n'.join(lines)
                 if len(body) > 3200:
-                    body = body[:3000] + '\n…остальные лоты в приложении.'
-                msg = 'Новости аукциона:\n' + body + '\nОткройте приложение, чтобы увидеть подробности.'
+                    body = body[:3000] + translate('notification_tick_04')
+                msg = translate('notification_tick_05') + body + translate('notification_tick_06')
                 if send(token,user[0],msg):
                     db.execute('BEGIN IMMEDIATE')
                     db.executemany('UPDATE events SET sent=1 WHERE id=?', [(r['id'],) for r in rows])
@@ -112,7 +113,7 @@ def tick(app, now=None, send=send_message):
                 job = f'reminder:{user[0]}'
                 if db.execute('SELECT 1 FROM jobs WHERE name=?', (job,)).fetchone():
                     continue
-                if send(token,user[0],'До завершения аукциона осталось меньше часа. Проверьте свои лоты и ставки в приложении.'):
+                if send(token,user[0],translate('notification_tick_07')):
                     db.execute('INSERT OR IGNORE INTO jobs(name,completed) VALUES(?,?)', (job,now))
             users = db.execute("SELECT DISTINCT user_id FROM events WHERE sent=0 AND kind='outbid' AND created>=?", (end-3600,)).fetchall()
             for user in users:
@@ -120,7 +121,7 @@ def tick(app, now=None, send=send_message):
                     WHERE e.user_id=? AND e.sent=0 AND e.kind='outbid' AND e.created>=? AND s.participation=1""", (user[0],end-3600)).fetchall()
                 if not rows:
                     continue
-                msg = 'Вашу ставку перебили: ' + ', '.join(dict.fromkeys(row['title'] for row in rows)) + '. Торги скоро завершатся — откройте приложение.'
+                msg = translate('notification_tick_08') + ', '.join(dict.fromkeys(row['title'] for row in rows)) + translate('notification_tick_09')
                 if send(token,user[0],msg):
                     db.executemany('UPDATE events SET sent=1 WHERE id=?', [(r['id'],) for r in rows])
     finally:

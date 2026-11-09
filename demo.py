@@ -6,19 +6,20 @@ os.environ['AUCTION_DEMO'] = '1'
 os.environ['AUCTION_DB'] = str(Path(__file__).resolve().parent / 'data' / 'demo.sqlite3')
 os.environ['AUCTION_UPLOADS'] = str(Path(__file__).resolve().parent / 'data' / 'demo-photos')
 from auction.app import create_app, connect
+from auction.i18n import translate
 app = create_app()
 db = connect(app.config['DB'])
 if not db.execute('SELECT 1 FROM lots LIMIT 1').fetchone():
     db.executemany('INSERT INTO lots(title,description,condition,start_price,step,created) VALUES(?,?,?,?,?,?)', [
-        ('Бокалы для вина', 'Набор из четырёх бокалов.', 'Отличное', 0, 50, time.time()),
-        ('Акустическая гитара', 'Акустическая гитара в рабочем состоянии.', 'Бережное использование', 500, 100, time.time()),
-        ('Парфюм', 'Почти полный флакон.', 'Открыт', 100, 50, time.time()),
+        (translate('demo_module_01'), translate('demo_module_02'), translate('demo_module_03'), 0, 50, time.time()),
+        (translate('demo_module_04'), translate('demo_module_05'), translate('demo_module_06'), 500, 100, time.time()),
+        (translate('demo_module_07'), translate('demo_module_08'), translate('demo_module_09'), 100, 50, time.time()),
     ])
 # Update only the exact old sample text; retain any edits made by the user.
 for before, after in (
-    ('Набор из четырёх бокалов. Будут рады долгим ужинам и хорошей компании.', 'Набор из четырёх бокалов.'),
-    ('Хорошая гитара для первых аккордов и вечеров с друзьями.', 'Акустическая гитара в рабочем состоянии.'),
-    ('Почти полный флакон. Расскажу подробнее при встрече.', 'Почти полный флакон.'),
+    (translate('demo_module_10'), translate('demo_module_02')),
+    (translate('demo_module_11'), translate('demo_module_05')),
+    (translate('demo_module_12'), translate('demo_module_08')),
 ):
     db.execute('UPDATE lots SET description=? WHERE description=?', (after, before))
 db.close()

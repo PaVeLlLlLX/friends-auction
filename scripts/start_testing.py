@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from auction.telegram import call, TelegramError
+from auction.i18n import translate
 
 CONFIG = ROOT / 'data' / 'testing-config.json'
 STATUS = ROOT / 'data' / 'testing-status.json'
@@ -95,12 +96,12 @@ def verify_public_url(url):
 def main():
     os.umask(0o077)
     if not CONFIG.is_file():
-        print('Сначала запустите «Подключить Telegram.command».')
+        print(translate('launcher_main_01'))
         return 1
     tunnel_bin = ROOT / '.tools' / 'cloudflared'
     server_bin = ROOT / '.venv' / 'bin' / 'gunicorn'
     if not tunnel_bin.is_file() or not server_bin.is_file():
-        print('Не найдены компоненты приложения или туннеля. Сохраните это сообщение и обратитесь к Codex.')
+        print(translate('launcher_main_02'))
         return 1
     try:
         with CONFIG.open(encoding='utf-8') as file:
@@ -109,10 +110,10 @@ def main():
         if type(admin_id) is not int or admin_id < 1 or not re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
             raise ValueError
     except (OSError, ValueError, KeyError, TypeError):
-        print('Не удалось прочитать настройки бота. Проверьте файл настроек.')
+        print(translate('launcher_main_03'))
         return 1
     if not free_port(PORT):
-        print(f'Порт {PORT} уже занят. Если тест уже запущен, используйте открытое окно; иначе освободите порт.')
+        print(translate('launcher_main_04', PORT))
         return 1
     STATUS.unlink(missing_ok=True)
     env = os.environ.copy()
@@ -122,7 +123,7 @@ def main():
     processes = []
     status_written = False
     try:
-        print('Запускаю тестовое приложение…', flush=True)
+        print(translate('launcher_main_05'), flush=True)
         server = subprocess.Popen([str(server_bin),'--bind',f'127.0.0.1:{PORT}','--workers','1','--threads','4','run:app'],
                                   cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         processes.append(server)
@@ -130,7 +131,7 @@ def main():
         ready = False
         for _ in range(40):
             if server.poll() is not None:
-                raise RuntimeError('Приложение не запустилось. Проверьте зависимости и настройки.')
+                raise RuntimeError(translate('launcher_main_06'))
             try:
                 with urllib.request.urlopen(local_url, timeout=1) as response:
                     ready = response.status == 200
@@ -139,8 +140,8 @@ def main():
             except (OSError, urllib.error.URLError):
                 time.sleep(.25)
         if not ready:
-            raise RuntimeError('Не удалось дождаться запуска приложения.')
-        print('Создаю временный защищённый адрес…', flush=True)
+            raise RuntimeError(translate('launcher_main_07'))
+        print(translate('launcher_main_08'), flush=True)
         tunnel = subprocess.Popen([str(tunnel_bin),'tunnel','--no-autoupdate','--protocol','http2','--url',f'http://127.0.0.1:{PORT}'],
                                   cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1)
         processes.append(tunnel)
@@ -150,8 +151,8 @@ def main():
         try:
             url = messages.get(timeout=60)
         except queue.Empty:
-            raise RuntimeError('Не удалось создать временный адрес. Проверьте соединение с интернетом.')
-        print(f'Адрес создан: {url}. Проверяю соединение…', flush=True)
+            raise RuntimeError(translate('launcher_main_09'))
+        print(translate('launcher_main_10', url), flush=True)
         reached = False
         for _ in range(15):
             reached = verify_public_url(url)
@@ -160,42 +161,42 @@ def main():
             time.sleep(2)
         if not reached:
             if diagnostics:
-                print('Состояние туннеля:', '\n'.join(diagnostics), flush=True)
-            raise RuntimeError('Адрес создан, но приложение через него не открылось.')
-        print('Соединение работает, подключаю кнопку бота…', flush=True)
+                print(translate('launcher_main_11'), '\n'.join(diagnostics), flush=True)
+            raise RuntimeError(translate('launcher_main_12'))
+        print(translate('launcher_main_13'), flush=True)
         try:
-            call(token, 'setChatMenuButton', {'menu_button':{'type':'web_app','text':'Открыть аукцион','web_app':{'url':url}}})
+            call(token, 'setChatMenuButton', {'menu_button':{'type':'web_app','text':translate('launcher_main_14'),'web_app':{'url':url}}})
         except TelegramError:
-            raise RuntimeError('Не удалось подключить кнопку приложения в Telegram.') from None
-        print('Кнопка подключена, запускаю обработку сообщений…', flush=True)
+            raise RuntimeError(translate('launcher_main_15')) from None
+        print(translate('launcher_main_16'), flush=True)
         worker_env = dict(env, AUCTION_BOT_POLL='1', AUCTION_APP_URL=url)
         worker = subprocess.Popen([str(ROOT/'.venv'/'bin'/'python'),'-m','auction.worker'], cwd=ROOT, env=worker_env,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         processes.append(worker)
         time.sleep(.5)
         if worker.poll() is not None:
-            raise RuntimeError('Не удалось запустить обработку сообщений бота. Проверьте, не запущен ли второй тест.')
+            raise RuntimeError(translate('launcher_main_17'))
         fd = os.open(STATUS, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as status:
             json.dump({'pid':os.getpid(), 'bot_username':username, 'url':url}, status)
         status_written = True
-        print('\nТЕСТ ГОТОВ. Ставки в нём учебные.\n')
-        print(f'Откройте бота в Telegram: https://t.me/{username}')
-        print('Нажмите «Запустить» или отправьте /start и откройте аукцион по кнопке.')
-        print('Другу можно передать ту же ссылку на бота. Доступ к каталогу получит любой, у кого есть адрес.')
-        print('Для ставок нужно ваше одобрение в разделе управления.')
-        print('Лоты и тестовые данные сохраняются на этом Mac отдельно от демо.\n')
-        print('Оставьте Mac включённым и не закрывайте это окно. Для остановки нажмите Ctrl+C.\n', flush=True)
+        print(translate('launcher_main_18'))
+        print(translate('launcher_main_19', username))
+        print(translate('launcher_main_20'))
+        print(translate('launcher_main_21'))
+        print(translate('launcher_main_22'))
+        print(translate('launcher_main_23'))
+        print(translate('launcher_main_24'), flush=True)
         while True:
             failed = next((p for p in processes if p.poll() is not None), None)
             if failed:
-                raise RuntimeError('Один из компонентов остановился. Запустите тест ещё раз.')
+                raise RuntimeError(translate('launcher_main_25'))
             time.sleep(2)
     except (RuntimeError, OSError) as error:
         print('\n' + str(error))
         return 1
     except KeyboardInterrupt:
-        print('\nОстанавливаю тест…')
+        print(translate('launcher_main_26'))
         return 0
     finally:
         if status_written:

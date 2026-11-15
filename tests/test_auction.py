@@ -1,3 +1,5 @@
+"""Behavioral and privacy checks using isolated databases and synthetic Telegram identities."""
+
 import hashlib
 import hmac
 import io
@@ -7,26 +9,77 @@ import sqlite3
 import time
 import urllib.error
 import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from email.message import Message
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
+from flask import Flask
+from flask.testing import FlaskClient
 from PIL import Image
+from werkzeug.test import TestResponse
 
 from auction.app import connect, create_app, verify_telegram
+from auction.contracts import JSONObject, JSONValue
 from auction.telegram import TelegramError, call
 from auction.worker import tick
 
 TOKEN = "123456:fake-test-token"
-SAMPLES = json.loads((Path(__file__).parent / "fixtures/messages.json").read_text(encoding="utf-8"))
 
 
-def sample(key):
+def json_object(value: JSONValue) -> JSONObject:
+    """Require an object at a tested JSON boundary without claiming field validation."""
+    assert isinstance(value, dict)
+    return value
+
+
+def json_response(response: TestResponse) -> JSONObject:
+    """Decode an HTTP response and require a JSON object, including error responses."""
+    value: JSONValue = response.get_json()
+    return json_object(value)
+
+
+def json_objects(value: JSONValue) -> list[JSONObject]:
+    """Require an array of objects before assertions inspect their individual fields."""
+    assert isinstance(value, list)
+    return [json_object(item) for item in value]
+
+
+def json_integer(value: JSONValue) -> int:
+    """Require an integer value, excluding JSON booleans, for fixture IDs and offsets."""
+    assert type(value) is int
+    return value
+
+
+def read_samples(path: Path) -> dict[str, str]:
+    """Read the localized fixture dictionary and assert every fixture value is text."""
+    value: JSONValue = json.loads(path.read_text(encoding="utf-8"))
+    entries = json_object(value)
+    result: dict[str, str] = {}
+    for key, text in entries.items():
+        assert isinstance(text, str)
+        result[key] = text
+    return result
+
+
+SAMPLES = read_samples(Path(__file__).parent / "fixtures/messages.json")
+
+
+def sample(key: str) -> str:
+    """Read a named localized fixture value without changing runtime messages."""
     return SAMPLES[key]
 
 
-def signed(user_id, name=sample("participant_name"), username="friend", date=None):
+def signed(
+    user_id: int,
+    name: str = sample("participant_name"),
+    username: str = "friend",
+    date: float | None = None,
+) -> str:
+    """Build Telegram initData signed with the test token and optional timestamp."""
     data = {
         "auth_date": str(int(time.time() if date is None else date)),
         "query_id": "test",
@@ -42,12 +95,14 @@ def signed(user_id, name=sample("participant_name"), username="friend", date=Non
     return urllib.parse.urlencode(data)
 
 
-def auth(user_id):
+def auth(user_id: int) -> dict[str, str]:
+    """Return authorization headers for an isolated synthetic Telegram account."""
     return {"X-Telegram-Init-Data": signed(user_id, username=f"u{user_id}")}
 
 
 @pytest.fixture
-def app(tmp_path):
+def app(tmp_path: Path) -> Flask:
+    """Create an auction with temporary storage and future test deadlines."""
     return create_app(
         {
             "TESTING": True,
@@ -62,14 +117,19 @@ def app(tmp_path):
 
 
 @pytest.fixture
-def client(app):
+def client(app: Flask) -> FlaskClient:
+    """Provide a Flask client without starting a network server."""
     return app.test_client()
 
 
-def test_initialization_closes_bootstrap_connection(tmp_path, monkeypatch):
+def test_initialization_closes_bootstrap_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ensure application initialization closes its one-time database connection."""
     connections = []
 
-    def observed_connect(path):
+    def observed_connect(path: str | os.PathLike[str]) -> sqlite3.Connection:
+        """Record bootstrap connections so their closure can be verified."""
         connection = connect(path)
         connections.append(connection)
         return connection
@@ -87,7 +147,8 @@ def test_initialization_closes_bootstrap_connection(tmp_path, monkeypatch):
         connections[0].execute("SELECT 1")
 
 
-def create_lot(client, start=0, step=50):
+def create_lot(client: FlaskClient, start: int = 0, step: int = 50) -> int:
+    """Create a lot as the organizer and return its generated identifier."""
     res = client.post(
         "/api/admin/lots",
         headers=auth(1),
@@ -100,10 +161,11 @@ def create_lot(client, start=0, step=50):
         },
     )
     assert res.status_code == 201, res.data
-    return res.json["lot"]["id"]
+    return json_integer(json_object(json_response(res)["lot"])["id"])
 
 
-def approve(client, uid):
+def approve(client: FlaskClient, uid: int) -> None:
+    """Submit private names and approve an account for all auction lots."""
     assert (
         client.post(
             "/api/application",
@@ -123,7 +185,8 @@ def approve(client, uid):
     )
 
 
-def bid(client, lot, uid, amount, expected):
+def bid(client: FlaskClient, lot: int, uid: int, amount: int, expected: int | None) -> TestResponse:
+    """Submit an amount together with the price observed by the participant."""
     return client.post(
         f"/api/lots/{lot}/bid",
         headers=auth(uid),
@@ -131,9 +194,11 @@ def bid(client, lot, uid, amount, expected):
     )
 
 
-def test_telegram_signature_and_expiry():
+def test_telegram_signature_and_expiry() -> None:
+    """Reject tampered, expired, malformed and incorrectly signed Telegram data."""
     raw = signed(42)
-    assert verify_telegram(raw, TOKEN)["id"] == 42
+    identity = verify_telegram(raw, TOKEN)
+    assert identity is not None and identity["id"] == 42
     assert verify_telegram(raw.replace("test", "evil"), TOKEN) is None
     assert verify_telegram(signed(42, date=time.time() - 86401), TOKEN) is None
     assert verify_telegram(raw, "wrong") is None
@@ -142,7 +207,10 @@ def test_telegram_signature_and_expiry():
     assert verify_telegram("auth_date=1&hash=" + "x" * 64, TOKEN) is None
 
 
-def test_anonymous_flood_does_not_block_administrator(app, client, monkeypatch):
+def test_anonymous_flood_does_not_block_administrator(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep anonymous write throttling separate from organizer access."""
     monkeypatch.setattr("auction.app.time.monotonic", lambda: 6000)
     statuses = [client.post("/api/application", json={}).status_code for _ in range(61)]
     assert statuses[:60] == [401] * 60
@@ -150,7 +218,10 @@ def test_anonymous_flood_does_not_block_administrator(app, client, monkeypatch):
     assert client.get("/api/admin/applications", headers=auth(1)).status_code == 200
 
 
-def test_one_signed_user_cannot_exhaust_another_users_write_limit(app, client, monkeypatch):
+def test_one_signed_user_cannot_exhaust_another_users_write_limit(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apply signed write limits independently to each participant."""
     monkeypatch.setattr("auction.app.time.monotonic", lambda: 6000)
     lot = create_lot(client)
     payload = {"kind": "watching", "enabled": True}
@@ -166,7 +237,10 @@ def test_one_signed_user_cannot_exhaust_another_users_write_limit(app, client, m
     )
 
 
-def test_trial_application_flood_is_limited_per_cloudflare_client(app, client, monkeypatch):
+def test_trial_application_flood_is_limited_per_cloudflare_client(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Limit trial applications by trusted client IP without blocking organizer reads."""
     monkeypatch.setattr("auction.app.time.monotonic", lambda: 6000)
     app.config["TRIAL"] = True
     payload = {
@@ -174,7 +248,8 @@ def test_trial_application_flood_is_limited_per_cloudflare_client(app, client, m
         "family_name": sample("family_name"),
     }
 
-    def headers(uid, ip):
+    def headers(uid: int, ip: str) -> dict[str, str]:
+        """Combine a signed account with a simulated trusted-proxy client address."""
         return {**auth(uid), "CF-Connecting-IP": ip}
 
     assert all(
@@ -201,11 +276,13 @@ def test_trial_application_flood_is_limited_per_cloudflare_client(app, client, m
     )
 
 
-def test_oversized_lot_id_is_not_a_server_error(client):
+def test_oversized_lot_id_is_not_a_server_error(client: FlaskClient) -> None:
+    """Return a missing-lot response for identifiers outside SQLite integer range."""
     assert client.get("/api/lots/" + "9" * 30).status_code == 404
 
 
-def test_zero_bid_step_approval_and_private_data(client):
+def test_zero_bid_step_approval_and_private_data(client: FlaskClient) -> None:
+    """Enforce admission, bid increments and stale-price checks without identity leaks."""
     lot = create_lot(client)
     assert bid(client, lot, 2, 0, None).status_code == 403
     approve(client, 2)
@@ -218,43 +295,52 @@ def test_zero_bid_step_approval_and_private_data(client):
     assert "user_id" not in public and "u2" not in public and "u3" not in public
     assert client.get("/api/admin/applications", headers=auth(2)).status_code == 403
     assert client.get(f"/api/admin/lots/{lot}", headers=auth(3)).status_code == 403
-    mine = client.get("/api/my-bids", headers=auth(2)).json["bids"]
+    mine = json_objects(json_response(client.get("/api/my-bids", headers=auth(2)))["bids"])
     assert [b["amount"] for b in mine] == [0]
-    assert client.get(f"/api/lots/{lot}", headers=auth(3)).json["lot"]["leading"]
+    assert json_object(json_response(client.get(f"/api/lots/{lot}", headers=auth(3)))["lot"])[
+        "leading"
+    ]
 
 
-def test_concurrent_bids_only_one_wins(app, client):
+def test_concurrent_bids_only_one_wins(app: Flask, client: FlaskClient) -> None:
+    """Accept only one of two bids made against the same observed price."""
     lot = create_lot(client, start=100)
     approve(client, 2)
     approve(client, 3)
 
-    def run(uid):
+    def run(uid: int) -> int:
+        """Submit a competing bid through an independent request context."""
         with app.test_client() as c:
             return bid(c, lot, uid, 100, None).status_code
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(run, [2, 3]))
     assert sorted(results) == [200, 409]
-    assert client.get(f"/api/lots/{lot}").json["lot"]["count"] == 1
+    assert json_object(json_response(client.get(f"/api/lots/{lot}"))["lot"])["count"] == 1
 
 
-def test_close_is_strict_and_no_late_bid(app, client):
+def test_close_is_strict_and_no_late_bid(app: Flask, client: FlaskClient) -> None:
+    """Close the lot at its deadline and reject subsequent bids."""
     lot = create_lot(client)
     approve(client, 2)
     app.config["END"] = time.time() - 1
     assert bid(client, lot, 2, 0, None).status_code == 409
-    assert client.get(f"/api/lots/{lot}").json["lot"]["status"] == "ended"
+    assert json_object(json_response(client.get(f"/api/lots/{lot}"))["lot"])["status"] == "ended"
 
 
-def test_bid_cannot_cross_deadline_during_request(app, client, monkeypatch):
+def test_bid_cannot_cross_deadline_during_request(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject a bid whose preparation starts before but completes after closing."""
     lot = create_lot(client)
     approve(client, 2)
     headers = auth(2)
     before = time.time()
     app.config["END"] = before + 1
-    calls = []
+    calls: list[None] = []
 
-    def clock():
+    def clock() -> float:
+        """Advance past the deadline after request preparation has completed."""
         calls.append(None)
         # Expiry guard, authentication, and first bid check all precede close.
         return before if len(calls) <= 3 else app.config["END"]
@@ -271,13 +357,17 @@ def test_bid_cannot_cross_deadline_during_request(app, client, monkeypatch):
         db.close()
 
 
-def test_lot_creation_rechecks_deadline_after_preparation(app, client, monkeypatch):
+def test_lot_creation_rechecks_deadline_after_preparation(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prevent a prepared lot from being committed after the auction closes."""
     headers = auth(1)
     before = time.time()
     app.config["END"] = before + 1
-    calls = []
+    calls: list[None] = []
 
-    def clock():
+    def clock() -> float:
+        """Advance past the deadline after request preparation has completed."""
         calls.append(None)
         return before if len(calls) <= 3 else app.config["END"]
 
@@ -295,10 +385,13 @@ def test_lot_creation_rechecks_deadline_after_preparation(app, client, monkeypat
         db.close()
 
 
-def test_photo_is_reencoded_and_rejects_fake_image(app, client):
+def test_photo_is_reencoded_and_rejects_fake_image(app: Flask, client: FlaskClient) -> None:
+    """Strip source metadata from valid photos and reject undecodable uploads."""
     image = Image.new("RGB", (15, 15), "red")
     output = io.BytesIO()
-    image.save(output, "JPEG", exif=b"Exif\x00\x00junk")
+    private_comment = b"private-original-comment"
+    image.save(output, "JPEG", exif=b"Exif\x00\x00junk", comment=private_comment)
+    assert private_comment in output.getvalue()
     output.seek(0)
     res = client.post(
         "/api/admin/lots",
@@ -312,9 +405,16 @@ def test_photo_is_reencoded_and_rejects_fake_image(app, client):
         content_type="multipart/form-data",
     )
     assert res.status_code == 201
-    photo = client.get(res.json["lot"]["photos"][0])
+    photos = json_object(json_response(res)["lot"])["photos"]
+    assert isinstance(photos, list)
+    photo_url = photos[0]
+    assert isinstance(photo_url, str)
+    photo = client.get(photo_url)
     assert photo.status_code == 200
     assert b"Exif\x00\x00junk" not in photo.data
+    assert private_comment not in photo.data
+    with Image.open(io.BytesIO(photo.data)) as normalized:
+        assert "comment" not in normalized.info and "exif" not in normalized.info
     res = client.post(
         "/api/admin/lots",
         headers=auth(1),
@@ -329,7 +429,8 @@ def test_photo_is_reencoded_and_rejects_fake_image(app, client):
     assert res.status_code == 400
 
 
-def test_large_valid_photo_is_accepted_with_form_limits(client):
+def test_large_valid_photo_is_accepted_with_form_limits(client: FlaskClient) -> None:
+    """Accept a valid photo larger than the default form-field size limit."""
     image = Image.frombytes("RGB", (600, 600), os.urandom(600 * 600 * 3))
     output = io.BytesIO()
     image.save(output, "JPEG", quality=90)
@@ -348,14 +449,18 @@ def test_large_valid_photo_is_accepted_with_form_limits(client):
     assert res.status_code == 201
 
 
-def test_failed_photo_write_rolls_back_database_and_partial_file(app, client, monkeypatch):
+def test_failed_photo_write_rolls_back_database_and_partial_file(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remove partial images and roll back the lot when a photo write fails."""
     image = Image.new("RGB", (15, 15), "red")
     output = io.BytesIO()
     image.save(output, "JPEG")
     output.seek(0)
     original_write = Path.write_bytes
 
-    def fail_partial_write(path, content):
+    def fail_partial_write(path: Path, content: bytes) -> None:
+        """Leave a partial photo on disk, then simulate storage failure."""
         original_write(path, content[:10])
         raise OSError("Simulated full disk")
 
@@ -381,7 +486,8 @@ def test_failed_photo_write_rolls_back_database_and_partial_file(app, client, mo
         db.close()
 
 
-def test_digest_and_reminder_no_duplicate(app, client):
+def test_digest_and_reminder_no_duplicate(app: Flask, client: FlaskClient) -> None:
+    """Send each daily digest and closing reminder only once per recipient."""
     lot = create_lot(client)
     approve(client, 2)
     approve(client, 3)
@@ -394,7 +500,8 @@ def test_digest_and_reminder_no_duplicate(app, client):
     db.close()
     messages = []
 
-    def sender(token, uid, message):
+    def sender(token: str, uid: int, message: str) -> bool:
+        """Record notification recipients and text without contacting Telegram."""
         messages.append((uid, message))
         return True
 
@@ -407,7 +514,8 @@ def test_digest_and_reminder_no_duplicate(app, client):
     assert sum(sample("reminder_fragment") in message for _, message in messages) == 2
 
 
-def test_retention_removes_data_and_files(app, client):
+def test_retention_removes_data_and_files(app: Flask, client: FlaskClient) -> None:
+    """Make expired data inaccessible and delete stored records and photographs."""
     create_lot(client)
     path = Path(app.config["UPLOADS"]) / "old.jpg"
     path.write_bytes(b"data")
@@ -421,7 +529,10 @@ def test_retention_removes_data_and_files(app, client):
     db.close()
 
 
-def test_edit_only_before_first_bid_and_fallback(app, client, monkeypatch):
+def test_edit_only_before_first_bid_and_fallback(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock bid-bearing lots and advance declined candidates with explicit approval."""
     lot = create_lot(client)
     data = {
         "title": sample("edited_lot_title"),
@@ -452,21 +563,25 @@ def test_edit_only_before_first_bid_and_fallback(app, client, monkeypatch):
         ).status_code
         == 200
     )
-    result = client.get(f"/api/admin/lots/{lot}", headers=auth(1)).json
-    assert [item["id"] for item in result["candidates"]] == [2]
+    result = json_response(client.get(f"/api/admin/lots/{lot}", headers=auth(1)))
+    assert [item["id"] for item in json_objects(result["candidates"])] == [2]
     assert result["fulfillment"] == ""
-    assert not client.get(f"/api/lots/{lot}", headers=auth(3)).json["lot"]["leading"]
-    fallback = client.get(f"/api/lots/{lot}", headers=auth(2)).json["lot"]
+    assert not json_object(json_response(client.get(f"/api/lots/{lot}", headers=auth(3)))["lot"])[
+        "leading"
+    ]
+    fallback = json_object(json_response(client.get(f"/api/lots/{lot}", headers=auth(2)))["lot"])
     assert fallback["leading"] and fallback["price"] == 0 and fallback["count"] == 2
-    assert [row["amount"] for row in result["bids"]] == [50, 0]
+    assert [row["amount"] for row in json_objects(result["bids"])] == [50, 0]
     import auction.worker
 
-    sent = []
-    monkeypatch.setattr(
-        auction.worker,
-        "send_message",
-        lambda token, uid, message: sent.append((uid, message)) or True,
-    )
+    sent: list[tuple[int, str]] = []
+
+    def sender(token: str, uid: int, message: str) -> bool:
+        """Record candidate offers without allowing external Telegram delivery."""
+        sent.append((uid, message))
+        return True
+
+    monkeypatch.setattr(auction.worker, "send_message", sender)
     assert (
         client.post(
             f"/api/admin/lots/{lot}/notify-candidate",
@@ -501,11 +616,12 @@ def test_edit_only_before_first_bid_and_fallback(app, client, monkeypatch):
         ).status_code
         == 200
     )
-    exhausted = client.get(f"/api/lots/{lot}", headers=auth(2)).json["lot"]
+    exhausted = json_object(json_response(client.get(f"/api/lots/{lot}", headers=auth(2)))["lot"])
     assert not exhausted["leading"] and exhausted["price"] is None and exhausted["count"] == 2
 
 
-def test_concurrent_refusals_cannot_skip_next_candidate(app, client):
+def test_concurrent_refusals_cannot_skip_next_candidate(app: Flask, client: FlaskClient) -> None:
+    """Ensure duplicate concurrent refusals cannot decline a second participant."""
     lot = create_lot(client)
     approve(client, 2)
     approve(client, 3)
@@ -519,7 +635,8 @@ def test_concurrent_refusals_cannot_skip_next_candidate(app, client):
         == 400
     )
 
-    def refuse(_):
+    def refuse(_: int) -> int:
+        """Decline the same candidate from an independent request context."""
         with app.test_client() as session:
             return session.post(
                 f"/api/admin/lots/{lot}",
@@ -530,23 +647,33 @@ def test_concurrent_refusals_cannot_skip_next_candidate(app, client):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(refuse, range(2)))
     assert sorted(results) == [200, 409]
-    remaining = client.get(f"/api/admin/lots/{lot}", headers=auth(1)).json["candidates"]
+    remaining = json_objects(
+        json_response(client.get(f"/api/admin/lots/{lot}", headers=auth(1)))["candidates"]
+    )
     assert [candidate["id"] for candidate in remaining] == [2]
 
 
-def test_last_hour_outbid_sends_without_daily_delay(app, client):
+def test_last_hour_outbid_sends_without_daily_delay(app: Flask, client: FlaskClient) -> None:
+    """Deliver last-hour outbid events without waiting for the daily digest."""
     lot = create_lot(client)
     approve(client, 2)
     approve(client, 3)
     app.config["END"] = time.time() + 1800
     assert bid(client, lot, 2, 0, None).status_code == 200
     assert bid(client, lot, 3, 50, 0).status_code == 200
-    sent = []
-    tick(app, time.time(), lambda token, uid, message: sent.append((uid, message)) or True)
+    sent: list[tuple[int, str]] = []
+
+    def sender(token: str, uid: int, message: str) -> bool:
+        """Record final-hour recipients and text in place of Telegram delivery."""
+        sent.append((uid, message))
+        return True
+
+    tick(app, time.time(), sender)
     assert any(uid == 2 and sample("outbid_fragment") in message for uid, message in sent)
 
 
-def test_public_access_and_explicit_participation_subscription(client):
+def test_public_access_and_explicit_participation_subscription(client: FlaskClient) -> None:
+    """Allow public browsing and watching while reserving participation for bidders."""
     lot = create_lot(client)
     assert client.get("/api/lots").status_code == 200
     assert (
@@ -567,7 +694,8 @@ def test_public_access_and_explicit_participation_subscription(client):
     )
 
 
-def test_application_requires_private_names_and_admin_only_visibility(client):
+def test_application_requires_private_names_and_admin_only_visibility(client: FlaskClient) -> None:
+    """Require both applicant names and expose them only to the organizer."""
     lot = create_lot(client)
     assert client.post("/api/application", headers=auth(2), json={}).status_code == 400
     assert (
@@ -579,14 +707,16 @@ def test_application_requires_private_names_and_admin_only_visibility(client):
         == 400
     )
     assert (
-        client.post(
-            "/api/application",
-            headers=auth(2),
-            json={
-                "given_name": sample("padded_given_name"),
-                "family_name": sample("padded_family_name"),
-            },
-        ).json["status"]
+        json_response(
+            client.post(
+                "/api/application",
+                headers=auth(2),
+                json={
+                    "given_name": sample("padded_given_name"),
+                    "family_name": sample("padded_family_name"),
+                },
+            )
+        )["status"]
         == "pending"
     )
     assert (
@@ -594,14 +724,16 @@ def test_application_requires_private_names_and_admin_only_visibility(client):
         == 200
     )
     assert bid(client, lot, 2, 0, None).status_code == 200
-    owner = client.get("/api/admin/applications", headers=auth(1)).json["users"][0]
+    owner = json_objects(
+        json_response(client.get("/api/admin/applications", headers=auth(1)))["users"]
+    )[0]
     assert (owner["applicant_given_name"], owner["applicant_family_name"]) == (
         sample("given_name"),
         sample("private_family_name"),
     )
-    assert client.get(f"/api/admin/lots/{lot}", headers=auth(1)).json["candidates"][0][
-        "applicant_family_name"
-    ] == sample("private_family_name")
+    assert json_objects(
+        json_response(client.get(f"/api/admin/lots/{lot}", headers=auth(1)))["candidates"]
+    )[0]["applicant_family_name"] == sample("private_family_name")
     for path, headers in [
         ("/api/lots", {}),
         (f"/api/lots/{lot}", auth(3)),
@@ -615,7 +747,8 @@ def test_application_requires_private_names_and_admin_only_visibility(client):
     assert client.get(f"/api/admin/lots/{lot}", headers=auth(3)).status_code == 403
 
 
-def test_existing_database_migrates_without_losing_applications(tmp_path):
+def test_existing_database_migrates_without_losing_applications(tmp_path: Path) -> None:
+    """Add applicant-name fields without losing existing admission requests."""
     db_path = str(tmp_path / "old.sqlite3")
     db = connect(db_path)
     db.execute(
@@ -633,16 +766,19 @@ def test_existing_database_migrates_without_losing_applications(tmp_path):
         }
     )
     client = app.test_client()
-    user = client.get("/api/admin/applications", headers=auth(1)).json["users"][0]
+    user = json_objects(
+        json_response(client.get("/api/admin/applications", headers=auth(1)))["users"]
+    )[0]
     assert user["id"] == 2 and user["status"] == "pending"
     assert user["applicant_given_name"] == user["applicant_family_name"] == ""
 
 
-def test_bot_start_only_answers_private_request_and_persists_cursor(app):
+def test_bot_start_only_answers_private_request_and_persists_cursor(app: Flask) -> None:
+    """Answer private start commands once and persist the Telegram update cursor."""
     from auction.worker import poll_start_messages
 
-    requests = []
-    incoming = [
+    requests: list[tuple[str, JSONObject]] = []
+    incoming: list[JSONObject] = [
         {
             "update_id": 10,
             "message": {"chat": {"type": "private", "id": 2}, "from": {"id": 2}, "text": "/start"},
@@ -657,28 +793,36 @@ def test_bot_start_only_answers_private_request_and_persists_cursor(app):
         },
     ]
 
-    def fake(token, method, payload):
+    def fake(token: str, method: str, payload: JSONObject) -> JSONValue:
+        """Emulate Telegram updates and delivery using only in-memory fixtures."""
         requests.append((method, payload))
         if method == "getUpdates":
-            return [u for u in incoming if u["update_id"] >= payload["offset"]]
+            offset = json_integer(payload["offset"])
+            return [update for update in incoming if json_integer(update["update_id"]) >= offset]
         return {"message_id": 1}
 
     poll_start_messages(app, "https://example.test", fake)
     sent = [p for method, p in requests if method == "sendMessage"]
     assert len(sent) == 1 and sent[0]["chat_id"] == 2
-    assert (
-        sent[0]["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"] == "https://example.test"
-    )
+    keyboard = json_object(sent[0]["reply_markup"])["inline_keyboard"]
+    assert isinstance(keyboard, list)
+    button_row = keyboard[0]
+    assert isinstance(button_row, list)
+    web_app = json_object(json_object(button_row[0])["web_app"])
+    assert web_app["url"] == "https://example.test"
     poll_start_messages(app, "https://example.test", fake)
     assert len([p for method, p in requests if method == "sendMessage"]) == 1
     assert requests[-1][1]["offset"] == 13
 
 
 @pytest.mark.parametrize("retryable", [False, True])
-def test_bot_start_delivery_failure_only_blocks_cursor_when_retryable(app, retryable):
+def test_bot_start_delivery_failure_only_blocks_cursor_when_retryable(
+    app: Flask, retryable: bool
+) -> None:
+    """Retry transient deliveries while advancing past permanent Telegram failures."""
     from auction.worker import poll_start_messages
 
-    incoming = [
+    incoming: list[JSONObject] = [
         {
             "update_id": 10,
             "message": {"chat": {"type": "private", "id": 2}, "from": {"id": 2}, "text": "/start"},
@@ -688,14 +832,16 @@ def test_bot_start_delivery_failure_only_blocks_cursor_when_retryable(app, retry
             "message": {"chat": {"type": "private", "id": 3}, "from": {"id": 3}, "text": "/start"},
         },
     ]
-    delivered = []
+    delivered: list[int] = []
 
-    def fake(token, method, payload):
+    def fake(token: str, method: str, payload: JSONObject) -> JSONValue:
+        """Emulate Telegram updates and delivery using only in-memory fixtures."""
         if method == "getUpdates":
-            return [update for update in incoming if update["update_id"] >= payload["offset"]]
+            offset = json_integer(payload["offset"])
+            return [update for update in incoming if json_integer(update["update_id"]) >= offset]
         if payload["chat_id"] == 2:
             raise TelegramError("Delivery failed", retryable=retryable)
-        delivered.append(payload["chat_id"])
+        delivered.append(json_integer(payload["chat_id"]))
         return {"message_id": 1}
 
     poll_start_messages(app, "https://example.test", fake)
@@ -711,12 +857,16 @@ def test_bot_start_delivery_failure_only_blocks_cursor_when_retryable(app, retry
 
 
 @pytest.mark.parametrize(("status", "retryable"), [(403, False), (429, True), (502, True)])
-def test_telegram_http_errors_are_sanitized_and_classified(monkeypatch, status, retryable):
+def test_telegram_http_errors_are_sanitized_and_classified(
+    monkeypatch: pytest.MonkeyPatch, status: int, retryable: bool
+) -> None:
+    """Classify retryable HTTP failures without exposing tokens or response details."""
     secret = "fake-private-token"
 
-    def reject(request, timeout):
+    def reject(request: urllib.request.Request, timeout: float) -> NoReturn:
+        """Raise an HTTP failure containing details that must remain private."""
         raise urllib.error.HTTPError(
-            request.full_url, status, "private response", {}, io.BytesIO(b"private details")
+            request.full_url, status, "private response", Message(), io.BytesIO(b"private details")
         )
 
     monkeypatch.setattr("auction.telegram.urllib.request.urlopen", reject)
@@ -727,7 +877,10 @@ def test_telegram_http_errors_are_sanitized_and_classified(monkeypatch, status, 
     assert caught.value.__suppress_context__
 
 
-def test_worker_stops_after_successful_retention_cleanup(app, monkeypatch):
+def test_worker_stops_after_successful_retention_cleanup(
+    app: Flask, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit the worker after cleanup rather than repeating an expired auction loop."""
     from auction import worker
 
     app.config["DELETE_AFTER"] = time.time() - 1
@@ -735,19 +888,21 @@ def test_worker_stops_after_successful_retention_cleanup(app, monkeypatch):
     cleaned = []
     original_tick = worker.tick
 
-    def cleanup(selected_app):
+    def cleanup(selected_app: Flask) -> bool | None:
+        """Record the final retention pass while running the real cleanup logic."""
         cleaned.append(selected_app)
         return original_tick(selected_app)
 
     monkeypatch.setattr(worker, "tick", cleanup)
     monkeypatch.setattr(
-        worker.time, "sleep", lambda seconds: pytest.fail("Worker repeated completed cleanup")
+        time, "sleep", lambda seconds: pytest.fail("Worker repeated completed cleanup")
     )
     worker.main()
     assert cleaned == [app]
 
 
-def test_last_hour_notification_is_bounded_even_for_many_lots(app):
+def test_last_hour_notification_is_bounded_even_for_many_lots(app: Flask) -> None:
+    """Bound aggregated Telegram text while acknowledging all included events."""
     now = datetime(2026, 11, 6, 10, 0, tzinfo=timezone.utc).timestamp()
     app.config["END"] = now + 1800
     db = connect(app.config["DB"])
@@ -767,8 +922,14 @@ def test_last_hour_notification_is_bounded_even_for_many_lots(app):
             )
     finally:
         db.close()
-    messages = []
-    tick(app, now, lambda token, uid, message: messages.append(message) or True)
+    messages: list[str] = []
+
+    def sender(token: str, uid: int, message: str) -> bool:
+        """Capture the aggregated text without a Telegram network request."""
+        messages.append(message)
+        return True
+
+    tick(app, now, sender)
     assert len(messages) == 1 and len(messages[0]) <= 4096
     db = connect(app.config["DB"])
     try:
@@ -777,16 +938,18 @@ def test_last_hour_notification_is_bounded_even_for_many_lots(app):
         db.close()
 
 
-def test_trial_mode_is_explicit_and_does_not_enable_demo(app, client):
+def test_trial_mode_is_explicit_and_does_not_enable_demo(app: Flask, client: FlaskClient) -> None:
+    """Expose the trial marker while retaining Telegram authorization requirements."""
     app.config["TRIAL"] = True
-    me = client.get("/api/me").json
+    me = json_response(client.get("/api/me"))
     assert me["trial"] is True and me["demo"] is False and me["user"] is None
     assert (
         client.get("/api/admin/applications", headers={"X-Demo-User": "admin"}).status_code == 401
     )
 
 
-def test_product_bid_history_is_complete_and_only_for_admin(client):
+def test_product_bid_history_is_complete_and_only_for_admin(client: FlaskClient) -> None:
+    """Return the full named bid history exclusively to the organizer."""
     lot = create_lot(client)
     for uid, first, last in [
         (2, sample("given_name"), sample("family_name")),
@@ -813,7 +976,9 @@ def test_product_bid_history_is_complete_and_only_for_admin(client):
     assert bid(client, lot, 2, 0, None).status_code == 200
     assert bid(client, lot, 3, 50, 0).status_code == 200
     assert bid(client, lot, 2, 100, 50).status_code == 200
-    history = client.get(f"/api/admin/lots/{lot}", headers=auth(1)).json["bids"]
+    history = json_objects(
+        json_response(client.get(f"/api/admin/lots/{lot}", headers=auth(1)))["bids"]
+    )
     assert [
         (b["amount"], b["applicant_given_name"], b["applicant_family_name"]) for b in history
     ] == [

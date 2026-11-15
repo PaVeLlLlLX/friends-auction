@@ -17,11 +17,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from auction.app import DELETE_AFTER
+from auction.contracts import JSONObject, JSONValue
 from auction.i18n import translate
 from auction.telegram import TelegramError, call
 
@@ -30,7 +33,12 @@ STATUS = ROOT / "data" / "testing-status.json"
 PORT = 8090
 
 
-def free_port(port):
+def free_port(port: int) -> bool:
+    """Return whether localhost can currently bind the requested TCP port.
+
+    This is an early diagnostic only; the server must still handle a bind race
+    after this probe closes its socket.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -40,7 +48,16 @@ def free_port(port):
         return True
 
 
-def read_url(process, messages, diagnostics):
+def read_url(
+    process: subprocess.Popen[str], messages: queue.Queue[str], diagnostics: deque[str]
+) -> None:
+    """Read a tunnel's stderr, queue its public URL and retain diagnostic lines.
+
+    The caller must start the process with a text-mode stderr pipe. The bounded
+    deque is consumed after the reader thread stops to avoid exposing raw logs.
+    """
+    if process.stderr is None:
+        raise ValueError("Tunnel URL discovery requires a stderr pipe.")
     for line in iter(process.stderr.readline, ""):
         if " ERR " in line or "Registered tunnel connection" in line:
             diagnostics.append(line.strip())
@@ -49,13 +66,21 @@ def read_url(process, messages, diagnostics):
             messages.put(match.group(0))
 
 
-def read_diagnostics(process, diagnostics):
+def read_diagnostics(process: subprocess.Popen[str], diagnostics: deque[str]) -> None:
+    """Drain a text stderr pipe into the caller's bounded startup-log buffer."""
+    if process.stderr is None:
+        raise ValueError("Process diagnostics require a stderr pipe.")
     for line in iter(process.stderr.readline, ""):
         diagnostics.append(line.rstrip())
 
 
-def save_diagnostics(diagnostics, token):
-    """Keep private, bounded process diagnostics out of terminal output."""
+def save_diagnostics(diagnostics: Mapping[str, Iterable[str]], token: str) -> str:
+    """Write supplied diagnostic tails to a private log and return its path.
+
+    The exact bot token and HTTP(S) URLs are redacted before writing. The caller
+    supplies bounded tails; the new file uses ``0600`` permissions and remains
+    outside Git in the integration data directory.
+    """
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -69,10 +94,15 @@ def save_diagnostics(diagnostics, token):
                 line = line.replace(token, "[redacted]") if token else line
                 line = re.sub(r"https?://\S+", "[url]", line)
                 log.write(f"[{component}] {line}\n")
-        return log.name
+        return str(log.name)
 
 
-def stop(processes):
+def stop(processes: Sequence[subprocess.Popen[str]]) -> None:
+    """Stop child processes in reverse startup order, escalating after five seconds.
+
+    Already exited children are reaped without being signalled. A child that
+    ignores termination is killed, then given another bounded wait to exit.
+    """
     for process in reversed(processes):
         if process.poll() is None:
             process.terminate()
@@ -84,8 +114,13 @@ def stop(processes):
             process.wait(timeout=5)
 
 
-def verify_public_url(url):
-    """Verify the endpoint with TLS, without caching an unready name in local DNS."""
+def verify_public_url(url: str) -> bool:
+    """Check that an HTTPS Quick Tunnel serves the expected catalog response.
+
+    DNS-over-HTTPS avoids caching a newly issued but unready name in the local
+    resolver. TLS still verifies the tunnel hostname. If that DNS request fails,
+    the system resolver is tried instead; failed probes return ``False``.
+    """
     host = urllib.parse.urlsplit(url).hostname
     if not host or not re.fullmatch(r"[a-z0-9-]+\.trycloudflare\.com", host):
         return False
@@ -95,8 +130,19 @@ def verify_public_url(url):
     request = urllib.request.Request(query, headers={"Accept": "application/dns-json"})
     try:
         with urllib.request.urlopen(request, timeout=6) as response:
-            dns = json.load(response)
-        addresses = [answer["data"] for answer in dns.get("Answer", []) if answer.get("type") == 1]
+            dns = cast(JSONValue, json.load(response))
+        if not isinstance(dns, dict):
+            raise ValueError("DNS response must be a JSON object.")
+        answers = dns.get("Answer", [])
+        if not isinstance(answers, list):
+            raise ValueError("DNS answers must be a JSON list.")
+        addresses: list[str] = []
+        for answer in answers:
+            if not isinstance(answer, dict):
+                continue
+            address = answer.get("data")
+            if answer.get("type") == 1 and isinstance(address, str):
+                addresses.append(address)
         for address in addresses:
             context = ssl.create_default_context()
             connection = http.client.HTTPSConnection(host, timeout=6, context=context)
@@ -105,7 +151,12 @@ def verify_public_url(url):
                 connection.sock = context.wrap_socket(raw, server_hostname=host)
                 connection.request("GET", "/api/lots", headers={"Host": host})
                 response = connection.getresponse()
-                if response.status == 200 and isinstance(json.load(response).get("lots"), list):
+                document = cast(JSONValue, json.load(response))
+                if (
+                    response.status == 200
+                    and isinstance(document, dict)
+                    and isinstance(document.get("lots"), list)
+                ):
                     return True
             except (OSError, ValueError, http.client.HTTPException):
                 pass
@@ -115,14 +166,24 @@ def verify_public_url(url):
         # If DNS-over-HTTPS itself is unavailable, use the system resolver.
         try:
             with urllib.request.urlopen(url + "/api/lots", timeout=6) as response:
-                return response.status == 200 and isinstance(json.load(response).get("lots"), list)
+                document = cast(JSONValue, json.load(response))
+                return (
+                    response.status == 200
+                    and isinstance(document, dict)
+                    and isinstance(document.get("lots"), list)
+                )
         except (OSError, urllib.error.URLError, ValueError):
             return False
     return False
 
 
-def cleanup_expired_environment(env, token):
-    """Run the retention worker without starting public services."""
+def cleanup_expired_environment(env: Mapping[str, str], token: str) -> int:
+    """Run only the expired integration environment's retention worker.
+
+    ``env`` selects the isolated database and uploads. Return zero on successful
+    cleanup, otherwise return one and save a private sanitized diagnostic tail
+    when available. No public server, tunnel or Telegram polling is started.
+    """
     try:
         result = subprocess.run(
             [sys.executable, "-m", "auction.worker"],
@@ -149,7 +210,14 @@ def cleanup_expired_environment(env, token):
     return 0
 
 
-def main():
+def main() -> int:
+    """Start and supervise the isolated Telegram integration environment.
+
+    Load and validate private configuration before launching child processes.
+    Expired environments run cleanup only. For an active environment, configure
+    the public bot menu after readiness checks and stop all children on exit.
+    Return zero on interruption or successful cleanup and one on startup failure.
+    """
     os.umask(0o077)
     if not CONFIG.is_file():
         print(translate("launcher_configuration_missing"))
@@ -158,13 +226,16 @@ def main():
     server_bin = ROOT / ".venv" / "bin" / "gunicorn"
     try:
         with CONFIG.open(encoding="utf-8") as file:
-            config = json.load(file)
+            config = cast(JSONValue, json.load(file))
+        if not isinstance(config, dict):
+            raise ValueError("Integration configuration must be a JSON object.")
         token, admin_id, username = config["token"], config["admin_id"], config["username"]
         if (
             not isinstance(token, str)
             or not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{20,}", token)
             or type(admin_id) is not int
             or admin_id < 1
+            or not isinstance(username, str)
             or not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username)
         ):
             raise ValueError
@@ -192,9 +263,11 @@ def main():
         print(translate("launcher_port_in_use", PORT))
         return 1
     STATUS.unlink(missing_ok=True)
-    processes = []
-    readers = []
-    diagnostics = {name: deque(maxlen=20) for name in ("server", "tunnel", "worker")}
+    processes: list[subprocess.Popen[str]] = []
+    readers: list[threading.Thread] = []
+    diagnostics: dict[str, deque[str]] = {
+        name: deque(maxlen=20) for name in ("server", "tunnel", "worker")
+    }
     status_written = False
     failed_run = False
     try:
@@ -255,7 +328,7 @@ def main():
             bufsize=1,
         )
         processes.append(tunnel)
-        messages = queue.Queue()
+        messages: queue.Queue[str] = queue.Queue()
         reader = threading.Thread(
             target=read_url, args=(tunnel, messages, diagnostics["tunnel"]), daemon=True
         )
@@ -313,7 +386,8 @@ def main():
             raise RuntimeError(translate("launcher_worker_failed"))
         fd = os.open(STATUS, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as status:
-            json.dump({"pid": os.getpid(), "bot_username": username, "url": url}, status)
+            status_document: JSONObject = {"pid": os.getpid(), "bot_username": username, "url": url}
+            json.dump(status_document, status)
         status_written = True
         print(translate("launcher_ready"))
         print(translate("launcher_bot_url", username))

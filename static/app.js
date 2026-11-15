@@ -1,12 +1,77 @@
 'use strict';
+
+/**
+ * Find a view element and verify its native DOM class before reading typed properties.
+ * Missing optional controls return null; a mismatched template is a programming error.
+ * @template {Element} T
+ * @param {string} selector
+ * @param {{new(): T}} Type
+ * @param {ParentNode} [parent=document]
+ * @returns {T | null}
+ */
+function findElement(selector, Type, parent = document) {
+  const element = parent.querySelector(selector);
+  if (element !== null && !(element instanceof Type))
+    throw new Error(`Unexpected element type: ${selector}`);
+  return element;
+}
+
+/**
+ * Require an element owned by the current template rather than asserting away null.
+ * @template {Element} T
+ * @param {string} selector
+ * @param {{new(): T}} Type
+ * @param {ParentNode} [parent=document]
+ * @returns {T}
+ */
+function requireElement(selector, Type, parent = document) {
+  const element = findElement(selector, Type, parent);
+  if (!element) throw new Error(`Missing view element: ${selector}`);
+  return element;
+}
+
+/**
+ * Collect controls from a template with the same native-class check as findElement.
+ * @template {Element} T
+ * @param {string} selector
+ * @param {{new(): T}} Type
+ * @param {ParentNode} [parent=document]
+ * @returns {T[]}
+ */
+function elements(selector, Type, parent = document) {
+  return Array.from(parent.querySelectorAll(selector)).map((element) => {
+    if (!(element instanceof Type)) throw new Error(`Unexpected element type: ${selector}`);
+    return element;
+  });
+}
+
+/** @param {unknown} error @returns {string} A useful message even for non-Error rejections. */
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** @param {unknown} error @returns {boolean} Whether a failed write may have reached the server. */
+function outcomeUnknown(error) {
+  return error instanceof Error && 'outcomeUnknown' in error && error.outcomeUnknown === true;
+}
+
+/**
+ * Initialize SDK/localization, bind the views and start visibility-aware polling.
+ * @returns {Promise<void>}
+ */
 (async function startApp() {
   const READ_TIMEOUT_MS = 15000;
   const WRITE_TIMEOUT_MS = 60000;
+  /** Load the SDK with a deadline; null keeps the public catalog available without authentication.
+   * @returns {Promise<TelegramWebApp | null>}
+   */
   function loadTelegramSdk() {
     if (window.Telegram && window.Telegram.WebApp) return Promise.resolve(window.Telegram.WebApp);
     return new Promise((resolve) => {
       const script = document.createElement('script');
+      /** @type {ReturnType<typeof setTimeout> | undefined} */
       let timeout;
+      /** Release startup exactly once the load finishes or its deadline expires. */
       const finish = () => {
         clearTimeout(timeout);
         script.onload = null;
@@ -26,9 +91,16 @@
       document.head.append(script);
     });
   }
+  /** Normalize optional browser storage to one of the explicit demonstration identities.
+   * @param {string | null} value @returns {DemoRole}
+   */
+  function demoRole(value) {
+    return value === 'friend' || value === 'other' || value === 'admin' ? value : 'guest';
+  }
   const telegramPromise = loadTelegramSdk();
   const translationController = new AbortController();
   const translationTimeout = setTimeout(() => translationController.abort(), READ_TIMEOUT_MS);
+  /** @type {Record<string, string>} */
   let messages;
   try {
     const response = await fetch('/assets/ru.json?v=2', {
@@ -36,23 +108,28 @@
       signal: translationController.signal,
     });
     if (!response.ok) throw new Error('Could not load translations.');
-    messages = await response.json();
+    // This is a trusted deployment resource assertion, not JSON schema validation.
+    messages = /** @type {Record<string, string>} */ (await response.json());
   } finally {
     clearTimeout(translationTimeout);
   }
+  /** Resolve a deployment message and fail explicitly on missing keys.
+   * @param {string} key @returns {string}
+   */
   const translate = (key) => {
     if (!Object.prototype.hasOwnProperty.call(messages, key))
       throw new Error(`Missing translation: ${key}`);
     return messages[key];
   };
-  const root = document.getElementById('app');
-  const toastEl = document.getElementById('toast');
+  const root = requireElement('#app', HTMLElement);
+  const toastEl = requireElement('#toast', HTMLElement);
+  /** @type {AppState} */
   const state = {
     me: null,
     lots: [],
     demo: false,
     trial: false,
-    role: sessionStorage.getItem('demoRole') || 'guest',
+    role: demoRole(sessionStorage.getItem('demoRole')),
     end: 0,
     adminView: null,
     adminLotId: null,
@@ -65,38 +142,68 @@
     tg.ready();
     tg.expand();
   }
+  /** Escape untrusted display values for the existing HTML templates.
+   * @param {unknown} s @returns {string}
+   */
   const esc = (s) =>
     String(s ?? '').replace(
       /[&<>"']/g,
-      (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+      (c) =>
+        /** @type {Record<string, string>} */ ({
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#39;',
+        })[c],
     );
+  /** @param {number} n @returns {string} Display integer rubles using the Russian number format. */
   const money = (n) => `${Number(n).toLocaleString('ru-RU')} ₽`;
+  /** @param {number} n @returns {string} Russian grammatical form for the public lot count. */
   const decl = (n) =>
     n % 10 === 1 && n % 100 !== 11
       ? translate('lot_count_one')
       : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14)
         ? translate('lot_count_few')
         : translate('lot_count_many');
+  /** @param {number} n @returns {string} Russian grammatical form for an accepted bid count. */
   const bidsWord = (n) =>
     n % 10 === 1 && n % 100 !== 11
       ? translate('bid_count_one')
       : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14)
         ? translate('bid_count_few')
         : translate('bid_count_many');
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
   let toastTimer;
   let pendingWrites = 0,
     mutationVersion = 0,
     loading = 0,
     viewVersion = 0,
-    ready = false,
-    detailRenderedSignature = null;
+    ready = false;
+  /** @type {string | null} */
+  let detailRenderedSignature = null;
+  /** The signature belongs to a rendered history container, never another route's replacement.
+   * @type {WeakMap<HTMLElement, string>}
+   */
+  const historySignatures = new WeakMap();
+  /** Show a transient status message, replacing any previous toast.
+   * @param {string} message @returns {void}
+   */
   function toast(message) {
     toastEl.textContent = message;
     toastEl.classList.add('visible');
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => toastEl.classList.remove('visible'), 4000);
   }
-  async function api(path, options = {}) {
+  /**
+   * Send an authenticated JSON/FormData request with a bounded lifetime.
+   * Successful JSON remains unknown until an endpoint wrapper asserts its wire contract.
+   * Transport failures on writes carry outcomeUnknown; callers must refresh, never retry blindly.
+   * @param {string} path
+   * @param {ApiRequestOptions} [options={}]
+   * @returns {Promise<unknown>}
+   */
+  async function requestJson(path, options = {}) {
     const isWrite = options.method && options.method.toUpperCase() !== 'GET';
     if (isWrite) {
       pendingWrites++;
@@ -104,6 +211,7 @@
     }
     const { signal: parentSignal, ...requestOptions } = options;
     const controller = new AbortController();
+    /** Forward caller cancellation and the request's own deadline to the same fetch. */
     const abort = () => controller.abort();
     if (parentSignal) {
       if (parentSignal.aborted) abort();
@@ -111,30 +219,49 @@
     }
     const timeout = setTimeout(abort, isWrite ? WRITE_TIMEOUT_MS : READ_TIMEOUT_MS);
     try {
+      /** @type {Record<string, string>} */
       const headers = { ...(requestOptions.headers || {}) };
       if (tg && tg.initData) headers['X-Telegram-Init-Data'] = tg.initData;
       if (state.demo) headers['X-Demo-User'] = state.role;
-      if (requestOptions.body && !(requestOptions.body instanceof FormData)) {
+      const body = requestOptions.body;
+      const encodedBody = body && !(body instanceof FormData) ? JSON.stringify(body) : body;
+      if (body && !(body instanceof FormData)) {
         headers['Content-Type'] = 'application/json';
-        requestOptions.body = JSON.stringify(requestOptions.body);
       }
-      let response, data;
+      let response;
+      /** @type {unknown} */
+      let data;
       try {
-        response = await fetch(path, { ...requestOptions, headers, signal: controller.signal });
+        response = await fetch(path, {
+          ...requestOptions,
+          body: encodedBody,
+          headers,
+          signal: controller.signal,
+        });
         data = await response.json();
       } catch (error) {
         const key = isWrite
           ? 'error_request_timeout_write'
-          : error.name === 'AbortError'
+          : error instanceof Error && error.name === 'AbortError'
             ? 'error_request_timeout_read'
             : response
               ? 'error_response_unreadable'
               : 'error_connection_failed';
+        /** @type {RequestFailure} */
         const failure = new Error(translate(key));
         failure.outcomeUnknown = Boolean(isWrite);
         throw failure;
       }
-      if (!response.ok) throw new Error(data.error || translate('error_request_failed'));
+      if (!response.ok) {
+        const message =
+          data !== null &&
+          typeof data === 'object' &&
+          'error' in data &&
+          typeof data.error === 'string'
+            ? data.error
+            : translate('error_request_failed');
+        throw new Error(message);
+      }
       return data;
     } finally {
       clearTimeout(timeout);
@@ -142,7 +269,28 @@
       if (isWrite) pendingWrites--;
     }
   }
-  const post = (path, body = {}) => api(path, { method: 'POST', body });
+  /**
+   * Read an endpoint's declared successful response. The assertion marks the external JSON boundary;
+   * it does not provide runtime schema validation or replace server authorization.
+   * @template {keyof ApiGetResponses} P
+   * @param {P} path
+   * @param {ApiReadOptions} [options={}]
+   * @returns {Promise<ApiGetResponses[P]>}
+   */
+  async function api(path, options = {}) {
+    return /** @type {ApiGetResponses[P]} */ (await requestJson(path, options));
+  }
+  /**
+   * Submit an endpoint-specific body once; state is subsequently reconciled through typed reads.
+   * Response types are asserted at the same external JSON boundary as api().
+   * @template {keyof ApiPostBodies} P
+   * @param {P} path
+   * @param {ApiPostBodies[P]} body
+   * @returns {Promise<ApiPostResponses[P]>}
+   */
+  async function post(path, body) {
+    return /** @type {ApiPostResponses[P]} */ (await requestJson(path, { method: 'POST', body }));
+  }
   // Enter in a single-line field finishes editing; only an explicit button submits.
   document.addEventListener('keydown', (event) => {
     const target = event.target;
@@ -156,13 +304,22 @@
       target.blur();
     }
   });
+  /** Return participation guidance without exposing authenticated account data.
+   * @returns {string}
+   */
   const authHint = () =>
     `<div class="panel"><h3>${translate('auth_title')}</h3><p>${translate('auth_description')}</p></div>`;
+  /** Mark the active public navigation item; an empty value is used for administrator views.
+   * @param {'catalog' | 'my' | 'about' | ''} which @returns {void}
+   */
   function nav(which) {
-    document
-      .querySelectorAll('[data-nav]')
-      .forEach((a) => a.classList.toggle('active', a.dataset.nav === which));
+    elements('[data-nav]', HTMLAnchorElement).forEach((a) =>
+      a.classList.toggle('active', a.dataset.nav === which),
+    );
   }
+  /** Render the role selector only in the server-declared local demonstration environment.
+   * @returns {void}
+   */
   function demoBar() {
     const old = document.querySelector('.demo-strip');
     if (old) old.remove();
@@ -185,7 +342,7 @@
     }
     s.value = state.role;
     s.onchange = () => {
-      state.role = s.value;
+      state.role = demoRole(s.value);
       sessionStorage.setItem('demoRole', s.value);
       location.hash = '#/';
       load();
@@ -193,6 +350,9 @@
     el.append(s);
     document.body.prepend(el);
   }
+  /** Label integration-mode activity so test bids are never presented as real bids.
+   * @returns {void}
+   */
   function trialBar() {
     const old = document.querySelector('.trial-strip');
     if (old) old.remove();
@@ -202,6 +362,9 @@
     el.textContent = translate('integration_banner');
     document.body.prepend(el);
   }
+  /** Keep SDK failure visible with an explicit reload action; late SDK arrival cannot silently change identity.
+   * @returns {void}
+   */
   function telegramBar() {
     const old = document.querySelector('.telegram-strip');
     if (old) old.remove();
@@ -219,6 +382,9 @@
     el.append(message, retry);
     document.body.prepend(el);
   }
+  /** Reload the user's permissions and catalog before rendering the currently selected route.
+   * @returns {Promise<void>}
+   */
   async function load() {
     loading++;
     try {
@@ -230,7 +396,7 @@
         state.me = again.user;
       } else state.me = me.user;
       state.end = me.end;
-      document.getElementById('admin-link').hidden = !(state.me && state.me.admin);
+      requireElement('#admin-link', HTMLButtonElement).hidden = !(state.me && state.me.admin);
       demoBar();
       trialBar();
       telegramBar();
@@ -241,12 +407,15 @@
     } catch (e) {
       root.innerHTML =
         `<div class="page"><div class="empty"><strong>${translate('catalog_load_failed')}</strong><p>` +
-        esc(e.message) +
+        esc(errorMessage(e)) +
         '</p></div></div>';
     } finally {
       loading--;
     }
   }
+  /** Build one public lot card, escaping server-controlled title, condition and photo URLs.
+   * @param {Lot} lot @returns {string}
+   */
   function card(lot) {
     const image = lot.photos.length
       ? `<img src="${esc(lot.photos[0])}" alt="${esc(lot.title)}">`
@@ -259,6 +428,9 @@
           : lot.condition;
     return `<a class="card" href="#/lot/${lot.id}"><div class="card-image">${image}${status ? `<span class="photo-label">${esc(status)}</span>` : ''}</div><div class="card-bottom"><h3 class="card-title">${esc(lot.title)}</h3><div class="card-price-row"><div><span class="small-label">${lot.price === null ? translate('price_start_label') : translate('price_current_label')}</span><span class="price">${money(lot.price === null ? lot.start_price : lot.price)}</span></div><span class="card-arrow" aria-hidden="true">↗</span></div><p class="card-meta">${lot.count} ${bidsWord(lot.count)} <span aria-hidden="true">·</span>${translate('bid_step_prefix')}${money(lot.step)}</p></div></a>`;
   }
+  /** Render the public catalog from the latest user-scoped lot snapshot.
+   * @returns {void}
+   */
   function catalog() {
     nav('catalog');
     const visible = state.lots;
@@ -267,6 +439,9 @@
  <div class="section-head"><h2>${translate('catalog_items_title')}</h2><span class="count">${visible.length} ${decl(visible.length)}</span></div>
  ${visible.length ? `<div class="grid">${visible.map(card).join('')}</div>` : `<div class="empty"><strong>${translate('catalog_empty_title')}</strong><p>${translate('catalog_empty_description')}</p></div>`}<footer class="footnote"><span>${translate('footer_title')}</span><a href="#/about">${translate('footer_rules')}</a></footer>`;
   }
+  /** Replace changed catalog cards while preserving the focused lot and scroll position.
+   * @returns {void}
+   */
   function refreshCatalog() {
     const active = document.activeElement;
     const focusedCard = active && root.contains(active) ? active.closest('.card') : null;
@@ -275,13 +450,16 @@
       scrollY = window.scrollY;
     catalog();
     if (focusedHref) {
-      const restored = Array.from(root.querySelectorAll('.card')).find(
+      const restored = Array.from(elements('.card', HTMLAnchorElement, root)).find(
         (card) => card.getAttribute('href') === focusedHref,
       );
       if (restored) restored.focus({ preventScroll: true });
     }
     window.scrollTo(scrollX, scrollY);
   }
+  /** Render a lot and bind explicit bid/application actions; private history is administrator-only.
+   * @param {Lot} lot @returns {void}
+   */
   function detail(lot) {
     detailRenderedSignature = JSON.stringify([
       lot,
@@ -321,35 +499,35 @@
         ? `<section class="admin-bid-history" aria-labelledby="admin-history-title"><div class="admin-history-heading"><h2 id="admin-history-title">${translate('history_title')}</h2><span>${translate('history_private_hint')}</span></div><div id="admin-bid-history" data-lot="${lot.id}" aria-live="polite"><p class="hint">${translate('history_loading')}</p></div></section>`
         : '';
     root.innerHTML = `<div class="page"><a class="back" href="#/">${translate('nav_catalog')}</a><div class="detail-layout"><div><div class="detail-photo">${images}</div>${thumbs}</div><div class="detail"><p class="eyebrow">${translate('pickup_value')}</p><h1 id="live-title">${esc(lot.title)}</h1><p class="detail-description" id="live-description">${esc(lot.description || translate('lot_description_missing'))}</p><p class="hint" id="live-condition">${translate('lot_condition_prefix')}${esc(lot.condition || translate('lot_condition_missing'))}</p><div class="detail-info"><div><span class="small-label" id="live-price-label">${lot.price === null ? translate('price_start_label') : translate('price_current_label')}</span><strong id="live-price">${money(price)}</strong></div><div><span class="small-label">${translate('lot_end_label')}</span><strong>${translate('lot_end_date')}</strong><div class="hint">23:59 · UTC+7</div></div></div><p class="live-change" id="live-change" role="status" hidden></p>${action}${subs}${history}</div></div></div>`;
-    document.querySelectorAll('[data-photo]').forEach(
+    elements('[data-photo]', HTMLButtonElement).forEach(
       (el) =>
         (el.onclick = () => {
-          document.getElementById('main-photo').src = el.dataset.photo;
+          requireElement('#main-photo', HTMLImageElement).src = el.dataset.photo || '';
         }),
     );
-    const application = document.getElementById('application-form');
+    const application = findElement('#application-form', HTMLFormElement);
     if (application)
       application.onsubmit = async (event) => {
         event.preventDefault();
-        const submit = application.querySelector('button');
+        const submit = requireElement('button', HTMLButtonElement, application);
         const form = new FormData(application);
         submit.disabled = true;
         try {
           await post('/api/application', {
-            given_name: form.get('given_name'),
-            family_name: form.get('family_name'),
+            given_name: /** @type {string} */ (form.get('given_name')),
+            family_name: /** @type {string} */ (form.get('family_name')),
           });
           toast(translate('application_sent'));
           await load();
         } catch (e) {
           submit.disabled = false;
-          toast(e.message);
+          toast(errorMessage(e));
         }
       };
-    const bid = document.getElementById('bid');
+    const bid = findElement('#bid', HTMLButtonElement);
     if (bid)
       bid.onclick = async () => {
-        const entered = document.getElementById('bid-amount').value.trim(),
+        const entered = requireElement('#bid-amount', HTMLInputElement).value.trim(),
           amount = Number(entered);
         const current = state.lots.find((item) => item.id === lot.id);
         if (
@@ -373,13 +551,13 @@
           toast(translate('bid_accepted'));
           await load();
         } catch (e) {
-          toast(e.message);
+          toast(errorMessage(e));
           bid.disabled = false;
           requestImmediateSync();
         }
       };
     for (const kind of ['watch', 'participation']) {
-      const el = document.getElementById(kind);
+      const el = findElement(`#${kind}`, HTMLInputElement);
       if (el)
         el.onchange = async () => {
           const enabled = el.checked;
@@ -391,8 +569,8 @@
             });
             toast(translate('subscriptions_saved'));
           } catch (e) {
-            if (!e.outcomeUnknown) el.checked = !enabled;
-            toast(e.message);
+            if (!outcomeUnknown(e)) el.checked = !enabled;
+            toast(errorMessage(e));
             requestImmediateSync();
           } finally {
             el.disabled = false;
@@ -401,41 +579,50 @@
     }
     if (state.me && state.me.admin) loadProductHistory(lot.id);
   }
+  /** Apply private bid history only to the current lot's administrator container.
+   * @param {number} lotId @param {AdminLotResponse} data @returns {void}
+   */
   function drawProductHistory(lotId, data) {
-    const box = document.getElementById('admin-bid-history');
+    const box = findElement('#admin-bid-history', HTMLElement);
     if (!box || box.dataset.lot !== String(lotId) || !state.me || !state.me.admin) return;
     const signature = JSON.stringify(data.bids);
-    if (box.historySignature === signature) return;
-    box.historySignature = signature;
+    if (historySignatures.get(box) === signature) return;
+    historySignatures.set(box, signature);
     box.innerHTML = data.bids.length
       ? `<div class="admin-history-list">${data.bids.map((b) => `<div class="admin-history-row"><div class="admin-history-person"><strong>${privateName(b)}</strong><small>${b.username ? '@' + esc(b.username) + ' · ' : ''}${esc(new Date(b.created * 1000).toLocaleString('ru-RU', { timeZone: 'Asia/Novosibirsk', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }))}</small></div><strong class="admin-history-amount">${money(b.amount)}</strong></div>`).join('')}</div>`
       : `<p class="hint">${translate('history_empty')}</p>`;
   }
+  /** Load administrator history without allowing a stale role/view response to replace current content.
+   * @param {number} lotId @returns {Promise<void>}
+   */
   async function loadProductHistory(lotId) {
-    const box = document.getElementById('admin-bid-history'),
+    const box = findElement('#admin-bid-history', HTMLElement),
       role = state.role;
     try {
       const data = await api(`/api/admin/lots/${lotId}`);
       if (
-        document.getElementById('admin-bid-history') === box &&
+        findElement('#admin-bid-history', HTMLElement) === box &&
         state.role === role &&
         box &&
-        !box.historySignature
+        !historySignatures.get(box)
       )
         drawProductHistory(lotId, data);
     } catch (e) {
       if (
         box &&
-        !box.historySignature &&
-        document.getElementById('admin-bid-history') === box &&
+        !historySignatures.get(box) &&
+        findElement('#admin-bid-history', HTMLElement) === box &&
         state.me &&
         state.me.admin
       )
         box.innerHTML = `<p class="hint">${translate('history_load_failed')}</p>`;
     }
   }
+  /** Render only the requesting participant's bids, with status derived from the current catalog.
+   * @param {MyBidsResponse} data @returns {void}
+   */
   function drawMyBids(data) {
-    const box = document.getElementById('my-content');
+    const box = findElement('#my-content', HTMLElement);
     if (!box) return;
     state.myBidsSignature = JSON.stringify([data.bids, state.lots]);
     if (!data.bids.length) {
@@ -459,26 +646,35 @@
       })
       .join('');
   }
+  /** Load the current participant's history and discard responses for a replaced route container.
+   * @returns {Promise<void>}
+   */
   async function my() {
     nav('my');
     root.innerHTML = `<div class="page"><p class="eyebrow">${translate('my_bids_kicker')}</p><h1 class="page-title">${translate('my_bids_title')}</h1><div id="my-content"></div></div>`;
-    const box = document.getElementById('my-content');
+    const box = requireElement('#my-content', HTMLElement);
     if (!state.me) {
       box.innerHTML = authHint();
       return;
     }
     try {
       const data = await api('/api/my-bids');
-      if (location.hash === '#/my' && document.getElementById('my-content') === box)
+      if (location.hash === '#/my' && findElement('#my-content', HTMLElement) === box)
         drawMyBids(data);
     } catch (e) {
-      if (document.getElementById('my-content') === box) box.textContent = e.message;
+      if (findElement('#my-content', HTMLElement) === box) box.textContent = errorMessage(e);
     }
   }
+  /** Render the localized participation and data-retention rules.
+   * @returns {void}
+   */
   function about() {
     nav('about');
     root.innerHTML = `<div class="page"><p class="eyebrow">${translate('rules_kicker')}</p><h1 class="page-title">${translate('rules_title')}</h1><div class="panel explain"><h3>${translate('rules_choose_title')}</h3><p>${translate('rules_choose_description')}</p><h3>${translate('rules_apply_title')}</h3><p>${translate('rules_apply_description')}</p><h3>${translate('rules_bid_title')}</h3><p>${translate('rules_bid_description')}</p><h3>${translate('rules_pickup_title')}</h3><p>${translate('rules_pickup_description')}</p><h3>${translate('rules_privacy_title')}</h3><p>${translate('rules_privacy_description')}</p></div></div>`;
   }
+  /** Format and escape private applicant names for views already restricted to the organizer.
+   * @param {PrivateIdentity} user @returns {string}
+   */
   function privateName(user) {
     return esc(
       [user.applicant_given_name, user.applicant_family_name].filter(Boolean).join(' ') ||
@@ -486,7 +682,15 @@
         translate('applicant_name_missing'),
     );
   }
+  /** Compare applications independently of server row ordering.
+   * @param {Applicant[]} users @returns {string}
+   */
   const applicationSignature = (users) => JSON.stringify([...users].sort((a, b) => a.id - b.id));
+  /** Lock sibling actions until completion; the callback can reject stale navigation before updating a view.
+   * @param {HTMLButtonElement} button
+   * @param {(isCurrent: () => boolean) => Promise<void>} action
+   * @returns {Promise<void>}
+   */
   async function runAdminAction(button, action) {
     if (button.disabled) return;
     const controls = Array.from(button.closest('.actions')?.querySelectorAll('button') || [button]);
@@ -498,23 +702,33 @@
     try {
       await action(() => currentView === viewVersion && location.hash === '#/admin');
     } catch (error) {
-      toast(error.message);
-      if (error.outcomeUnknown) requestImmediateSync();
+      toast(errorMessage(error));
+      if (outcomeUnknown(error)) requestImmediateSync();
     } finally {
       controls.forEach((control, index) => {
         control.disabled = disabledBefore[index];
       });
     }
   }
+  /** Render organizer navigation; server authorization is still required for every private request.
+   * @param {AdminTab} tab @returns {void}
+   */
   function adminShell(tab) {
     nav('');
     root.innerHTML = `<div class="page"><div class="admin-header"><div><p class="eyebrow">${translate('admin_kicker')}</p><h1 class="page-title">${translate('admin_title')}</h1></div><a class="back" href="#/">${translate('nav_home')}</a></div><div class="tabs"><button class="tab ${tab === 'lots' ? 'active' : ''}" data-tab="lots">${translate('admin_lots_tab')}</button><button class="tab ${tab === 'applications' ? 'active' : ''}" data-tab="applications">${translate('admin_applications_tab')}</button><button class="tab ${tab === 'new' ? 'active' : ''}" data-tab="new">${translate('admin_create_tab')}</button></div><div id="admin-content"></div></div>`;
-    document
-      .querySelectorAll('[data-tab]')
-      .forEach((b) => (b.onclick = () => admin(b.dataset.tab)));
+    elements('[data-tab]', HTMLButtonElement).forEach(
+      (b) =>
+        (b.onclick = () => {
+          const tab = b.dataset.tab;
+          if (tab === 'lots' || tab === 'applications' || tab === 'new') admin(tab);
+        }),
+    );
   }
+  /** Render private applications and bind explicit admission decisions with persistent feedback.
+   * @param {ApplicationsResponse} data @returns {void}
+   */
   function drawApplications(data) {
-    const box = document.getElementById('admin-content');
+    const box = findElement('#admin-content', HTMLElement);
     if (!box) return;
     state.applications = data.users;
     box.innerHTML = data.users.length
@@ -525,13 +739,14 @@
           )
           .join('')
       : `<div class="empty"><strong>${translate('applications_empty')}</strong></div>`;
-    box.querySelectorAll('[data-user]').forEach(
+    elements('[data-user]', HTMLButtonElement, box).forEach(
       (b) =>
         (b.onclick = async () => {
           const row = b.closest('[data-application]');
-          const buttons = Array.from(row.querySelectorAll('[data-user]'));
-          const message = row.querySelector('.application-result');
-          const badge = row.querySelector('.application-status');
+          if (!(row instanceof HTMLElement)) throw new Error('Missing application row.');
+          const buttons = Array.from(elements('[data-user]', HTMLButtonElement, row));
+          const message = requireElement('.application-result', HTMLElement, row);
+          const badge = requireElement('.application-status', HTMLElement, row);
           const original = b.textContent;
           buttons.forEach((button) => {
             button.disabled = true;
@@ -540,7 +755,9 @@
           message.hidden = true;
           try {
             const status = b.dataset.status;
-            await post(`/api/admin/users/${b.dataset.user}`, { status });
+            if (status !== 'approved' && status !== 'rejected')
+              throw new Error('Invalid application decision.');
+            await post(`/api/admin/users/${Number(b.dataset.user)}`, { status });
             row.dataset.currentStatus = status;
             const applicant =
               state.applications &&
@@ -558,7 +775,7 @@
             message.className = 'application-result success';
             message.hidden = false;
           } catch (e) {
-            message.textContent = `${translate('application_save_failed_prefix')}${e.message}`;
+            message.textContent = `${translate('application_save_failed_prefix')}${errorMessage(e)}`;
             message.className = 'application-result error';
             message.hidden = false;
           } finally {
@@ -570,6 +787,9 @@
         }),
     );
   }
+  /** Open an organizer tab while retaining unsaved create/edit forms during background polling.
+   * @param {AdminTab} [tab='lots'] @returns {Promise<void>}
+   */
   async function admin(tab = 'lots') {
     if (!state.me || !state.me.admin) {
       root.innerHTML = `<div class="page"><div class="empty"><strong>${translate('admin_access_denied')}</strong></div></div>`;
@@ -579,29 +799,35 @@
     state.adminView = tab;
     state.adminLotId = null;
     adminShell(tab);
-    const box = document.getElementById('admin-content');
+    const box = requireElement('#admin-content', HTMLElement);
     if (tab === 'new') {
       box.innerHTML = `<div class="panel"><h3>${translate('lot_create_title')}</h3><p>${translate('lot_common_deadline_hint')}</p><form id="new-lot"><label class="field"><span>${translate('lot_title_label_with_space')}<span class="required">*</span></span><input name="title" maxlength="120" required placeholder="${translate('lot_title_placeholder')}"></label><label class="field"><span>${translate('lot_description_label')}</span><textarea name="description" maxlength="3000" placeholder="${translate('lot_description_placeholder')}"></textarea></label><label class="field"><span>${translate('lot_condition_label')}</span><input name="condition" maxlength="120" placeholder="${translate('lot_condition_placeholder')}"></label><div class="input-row"><label class="field"><span>${translate('lot_start_price_label')}</span><input name="start_price" type="number" min="0" max="100000000" value="0" required></label><label class="field"><span>${translate('lot_step_label')}</span><input name="step" type="number" min="1" max="100000000" value="50" required></label></div><label class="field"><span>${translate('lot_photos_label')}</span><input name="photos" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" multiple></label><p class="hint">${translate('lot_photos_privacy_hint')}</p><button class="button full" type="submit">${translate('lot_publish')}</button></form></div>`;
-      document.getElementById('new-lot').onsubmit = async (e) => {
+      requireElement('#new-lot', HTMLFormElement).onsubmit = async (e) => {
         e.preventDefault();
-        const form = e.target;
-        await runAdminAction(form.querySelector('button'), async (isCurrent) => {
-          await api('/api/admin/lots', { method: 'POST', body: new FormData(form) });
-          toast(translate('lot_published'));
-          const d = await api('/api/lots');
-          state.lots = d.lots;
-          if (isCurrent()) admin('lots');
-        });
+        const form = requireElement('#new-lot', HTMLFormElement);
+        await runAdminAction(
+          requireElement('button', HTMLButtonElement, form),
+          async (isCurrent) => {
+            await post('/api/admin/lots', new FormData(form));
+            toast(translate('lot_published'));
+            const d = await api('/api/lots');
+            state.lots = d.lots;
+            if (isCurrent()) admin('lots');
+          },
+        );
       };
       return;
     }
     if (tab === 'applications') {
       try {
         const data = await api('/api/admin/applications');
-        if (state.adminView === 'applications' && document.getElementById('admin-content') === box)
+        if (
+          state.adminView === 'applications' &&
+          findElement('#admin-content', HTMLElement) === box
+        )
           drawApplications(data);
       } catch (e) {
-        if (document.getElementById('admin-content') === box) box.textContent = e.message;
+        if (findElement('#admin-content', HTMLElement) === box) box.textContent = errorMessage(e);
       }
       return;
     }
@@ -613,10 +839,13 @@
           )
           .join('')
       : `<div class="empty"><strong>${translate('admin_lots_empty_title')}</strong><p>${translate('admin_lots_empty_description')}</p></div>`;
-    box
-      .querySelectorAll('[data-manage]')
-      .forEach((b) => (b.onclick = () => adminLot(Number(b.dataset.manage))));
+    elements('[data-manage]', HTMLButtonElement, box).forEach(
+      (b) => (b.onclick = () => adminLot(Number(b.dataset.manage))),
+    );
   }
+  /** Load an organizer's lot controls and candidate snapshot, ignoring responses after route changes.
+   * @param {number} id @param {AdminLotResponse | null} [preloaded=null] @returns {Promise<void>}
+   */
   async function adminLot(id, preloaded = null) {
     viewVersion++;
     state.adminView = 'lot';
@@ -627,37 +856,40 @@
         return;
       state.adminLotSignature = JSON.stringify(data);
       const l = data.lot;
-      const box = document.getElementById('admin-content');
+      const box = findElement('#admin-content', HTMLElement);
       if (!box) return;
       box.innerHTML = `<button class="back back-button" id="admin-back">${translate('nav_catalog')}</button><div class="panel"><h3>${esc(l.title)}</h3><p>${l.status === 'active' ? translate('lot_bidding_active') : l.status === 'ended' ? translate('lot_ended_title') : translate('lot_status_cancelled')} · ${l.count}${translate('bid_count_suffix')}</p><div class="actions">${l.status === 'active' && l.count === 0 ? `<button class="button secondary" id="edit-lot">${translate('lot_edit')}</button>` : ''}${l.status === 'active' ? `<button class="button danger" id="cancel-lot">${translate('lot_cancel')}</button>` : ''}${l.status === 'ended' && data.candidates.length ? `<button class="button danger" id="refuse">${translate('candidate_refuse')}</button>${data.has_refusals ? `<button class="button secondary" id="notify-candidate">${translate('candidate_notify')}</button>` : ''}<button class="button secondary" data-fulfill="agreed">${translate('fulfillment_agreed_action')}</button><button class="button secondary" data-fulfill="delivered">${translate('fulfillment_delivered_action')}</button>` : ''}</div><p>${translate('fulfillment_label')}${data.fulfillment === 'agreed' ? translate('fulfillment_agreed') : data.fulfillment === 'delivered' ? translate('fulfillment_delivered') : translate('fulfillment_unset')}</p></div><h3>${translate('candidates_title')}</h3>${data.candidates.length ? data.candidates.map((u, i) => `<div class="list-item"><span><strong>${i === 0 ? '★ ' : ''}${privateName(u)} ${u.username ? '@' + esc(u.username) : ''}</strong><small>Telegram ID: ${u.id}</small></span><strong>${money(u.amount)}</strong></div>`).join('') : `<p class="hint">${translate('candidates_empty')}</p>`}<h3>${translate('history_title')}</h3>${data.bids.map((b) => `<div class="list-item"><span>${privateName(b)} ${b.username ? '@' + esc(b.username) : ''}</span><strong>${money(b.amount)}</strong></div>`).join('')}`;
-      document.getElementById('admin-back').onclick = () => admin('lots');
-      const edit = document.getElementById('edit-lot');
+      requireElement('#admin-back', HTMLButtonElement).onclick = () => admin('lots');
+      const edit = findElement('#edit-lot', HTMLButtonElement);
       if (edit)
         edit.onclick = () => {
           viewVersion++;
           state.adminView = 'edit';
           box.innerHTML = `<button class="back back-button" id="admin-back">${translate('nav_lot')}</button><div class="panel"><h3>${translate('lot_edit_title')}</h3><p>${translate('lot_edit_policy')}</p><p class="live-change" id="live-edit-warning" role="status" hidden></p><form id="edit-form"><label class="field"><span>${translate('lot_title_label')}</span><input name="title" maxlength="120" required value="${esc(l.title)}"></label><label class="field"><span>${translate('lot_description_label')}</span><textarea name="description" maxlength="3000">${esc(l.description)}</textarea></label><label class="field"><span>${translate('lot_condition_label')}</span><input name="condition" maxlength="120" value="${esc(l.condition)}"></label><label class="field"><span>${translate('lot_start_price_label')}</span><input name="start_price" type="number" min="0" required value="${l.start_price}"></label><label class="field"><span>${translate('lot_step_label')}</span><input name="step" type="number" min="1" required value="${l.step}"></label><button class="button full">${translate('lot_save')}</button></form></div>`;
-          document.getElementById('admin-back').onclick = () => adminLot(id);
-          document.getElementById('edit-form').onsubmit = async (e) => {
+          requireElement('#admin-back', HTMLButtonElement).onclick = () => adminLot(id);
+          requireElement('#edit-form', HTMLFormElement).onsubmit = async (e) => {
             e.preventDefault();
-            const form = e.target,
+            const form = requireElement('#edit-form', HTMLFormElement),
               f = new FormData(form);
-            await runAdminAction(form.querySelector('button'), async (isCurrent) => {
-              await post(`/api/admin/lots/${id}/edit`, {
-                title: f.get('title'),
-                description: f.get('description'),
-                condition: f.get('condition'),
-                start_price: Number(f.get('start_price')),
-                step: Number(f.get('step')),
-              });
-              const x = await api('/api/lots');
-              state.lots = x.lots;
-              toast(translate('lot_saved'));
-              if (isCurrent()) await adminLot(id);
-            });
+            await runAdminAction(
+              requireElement('button', HTMLButtonElement, form),
+              async (isCurrent) => {
+                await post(`/api/admin/lots/${id}/edit`, {
+                  title: /** @type {string} */ (f.get('title')),
+                  description: /** @type {string} */ (f.get('description')),
+                  condition: /** @type {string} */ (f.get('condition')),
+                  start_price: Number(f.get('start_price')),
+                  step: Number(f.get('step')),
+                });
+                const x = await api('/api/lots');
+                state.lots = x.lots;
+                toast(translate('lot_saved'));
+                if (isCurrent()) await adminLot(id);
+              },
+            );
           };
         };
-      const cancel = document.getElementById('cancel-lot');
+      const cancel = findElement('#cancel-lot', HTMLButtonElement);
       if (cancel)
         cancel.onclick = () => {
           if (confirm(translate('lot_cancel_confirm')))
@@ -669,7 +901,7 @@
               if (isCurrent()) admin('lots');
             });
         };
-      const refuse = document.getElementById('refuse');
+      const refuse = findElement('#refuse', HTMLButtonElement);
       if (refuse)
         refuse.onclick = () => {
           if (confirm(translate('candidate_refuse_confirm')))
@@ -681,7 +913,7 @@
               if (isCurrent()) await adminLot(id);
             });
         };
-      const notify = document.getElementById('notify-candidate');
+      const notify = findElement('#notify-candidate', HTMLButtonElement);
       if (notify)
         notify.onclick = () => {
           if (confirm(translate('candidate_notify_confirm')))
@@ -692,18 +924,24 @@
               toast(translate('candidate_notification_sent'));
             });
         };
-      box.querySelectorAll('[data-fulfill]').forEach(
+      elements('[data-fulfill]', HTMLButtonElement, box).forEach(
         (b) =>
           (b.onclick = () =>
             runAdminAction(b, async (isCurrent) => {
-              await post(`/api/admin/lots/${id}`, { action: b.dataset.fulfill });
+              const action = b.dataset.fulfill;
+              if (action !== 'agreed' && action !== 'delivered')
+                throw new Error('Invalid fulfillment action.');
+              await post(`/api/admin/lots/${id}`, { action });
               if (isCurrent()) await adminLot(id);
             })),
       );
     } catch (e) {
-      toast(e.message);
+      toast(errorMessage(e));
     }
   }
+  /** Dispatch the hash route against the current snapshot and reset scroll for deliberate navigation.
+   * @returns {void}
+   */
   function render() {
     viewVersion++;
     const hash = location.hash || '#/';
@@ -722,38 +960,49 @@
 
   // The temporary tunnel does not support server-sent events. Poll while the app is
   // visible, discard stale responses, and never replace a form containing a draft.
-  let syncTimer = null,
-    syncing = false,
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let syncTimer;
+  let syncing = false,
     resyncRequested = false;
+  /** Report whether the most recent visible refresh completed successfully.
+   * @param {boolean} connected @returns {void}
+   */
   function liveIndicator(connected) {
-    const indicator = document.getElementById('live-indicator');
+    const indicator = findElement('#live-indicator', HTMLElement);
     if (!indicator) return;
     const text = connected ? translate('connection_online') : translate('connection_offline');
     if (indicator.textContent !== text) indicator.textContent = text;
     indicator.classList.toggle('offline', !connected);
   }
+  /** Detect focused or edited fields so polling cannot discard a bid or application draft.
+   * @returns {boolean}
+   */
   function detailHasDraft() {
     const active = document.activeElement;
     if (active && root.contains(active) && active.matches('input:not([type=checkbox]), textarea'))
       return true;
-    const application = document.getElementById('application-form');
+    const application = findElement('#application-form', HTMLFormElement);
     if (
       application &&
       Array.from(application.querySelectorAll('input')).some((input) => input.value.trim() !== '')
     )
       return true;
-    const amount = document.getElementById('bid-amount');
+    const amount = findElement('#bid-amount', HTMLInputElement);
     return !!(amount && amount.value !== amount.defaultValue);
   }
+  /** Update live terms in place, preserving the draft and disabling bids when permissions or status change.
+   * @param {Lot} lot @returns {void}
+   */
   function patchDetail(lot) {
-    const byId = (id) => document.getElementById(id);
+    /** @param {string} id @returns {HTMLElement | null} Optional text-only view node. */
+    const byId = (id) => findElement(`#${id}`, HTMLElement);
     const title = byId('live-title'),
       description = byId('live-description'),
       condition = byId('live-condition');
     const price = byId('live-price'),
       label = byId('live-price-label'),
       hint = byId('live-bid-hint'),
-      amount = byId('bid-amount');
+      amount = findElement('#bid-amount', HTMLInputElement);
     if (title) title.textContent = lot.title;
     if (description)
       description.textContent = lot.description || translate('lot_description_missing');
@@ -771,13 +1020,16 @@
     }
     if (hint)
       hint.textContent = `${translate('bid_minimum_prefix')}${money(minimum)}${translate('bid_step_separator')}${money(lot.step)}${translate('bid_multiple_steps_hint')}`;
-    const watch = byId('watch'),
-      participation = byId('participation');
+    const watch = findElement('#watch', HTMLInputElement),
+      participation = findElement('#participation', HTMLInputElement);
     if (watch) watch.checked = lot.watching;
     if (participation) participation.checked = lot.participation;
     const warning = byId('live-change'),
-      bid = byId('bid');
-    const previous = detailRenderedSignature ? JSON.parse(detailRenderedSignature)[0] : null;
+      bid = findElement('#bid', HTMLButtonElement);
+    // The signature was produced locally from this exact tuple, not received from the network.
+    const previous = detailRenderedSignature
+      ? /** @type {DetailSnapshot} */ (JSON.parse(detailRenderedSignature))[0]
+      : null;
     let message = '';
     if (lot.status !== 'active')
       message =
@@ -797,6 +1049,9 @@
       warning.hidden = !message;
     }
   }
+  /** Coalesce refresh requests without overlapping active poll cycles.
+   * @returns {void}
+   */
   function requestImmediateSync() {
     if (syncing) {
       resyncRequested = true;
@@ -805,6 +1060,9 @@
     clearTimeout(syncTimer);
     syncTimer = setTimeout(syncNow, 0);
   }
+  /** Refresh visible views with an eight-second poll budget and reject stale mutation, role or view snapshots.
+   * @returns {Promise<void>}
+   */
   async function syncNow() {
     if (syncing) {
       resyncRequested = true;
@@ -832,12 +1090,17 @@
     try {
       const options = { signal: controller.signal };
       const [me, lots] = await Promise.all([api('/api/me', options), api('/api/lots', options)]);
+      /** @type {PollExtra} */
       let extra = null;
-      if (route === '#/my' && me.user) extra = await api('/api/my-bids', options);
+      if (route === '#/my' && me.user)
+        extra = { kind: 'my', data: await api('/api/my-bids', options) };
       if (route.startsWith('#/lot/') && me.user && me.user.admin)
-        extra = await api(`/api/admin/lots/${Number(route.split('/')[2])}`, options);
+        extra = {
+          kind: 'lot',
+          data: await api(`/api/admin/lots/${Number(route.split('/')[2])}`, options),
+        };
       if (route === '#/admin' && me.user && me.user.admin && adminView === 'applications')
-        extra = await api('/api/admin/applications', options);
+        extra = { kind: 'applications', data: await api('/api/admin/applications', options) };
       if (
         route === '#/admin' &&
         me.user &&
@@ -845,7 +1108,7 @@
         adminView === 'lot' &&
         adminLotId !== null
       )
-        extra = await api(`/api/admin/lots/${adminLotId}`, options);
+        extra = { kind: 'lot', data: await api(`/api/admin/lots/${adminLotId}`, options) };
       if (
         version !== mutationVersion ||
         pendingWrites ||
@@ -860,7 +1123,7 @@
       state.me = me.user;
       state.lots = lots.lots;
       state.end = lots.end;
-      document.getElementById('admin-link').hidden = !(state.me && state.me.admin);
+      requireElement('#admin-link', HTMLButtonElement).hidden = !(state.me && state.me.admin);
       liveIndicator(true);
       if (route === '#/' || route === '#') {
         if (lotsChanged) refreshCatalog();
@@ -873,38 +1136,48 @@
         if (signature !== detailRenderedSignature) {
           if (lot && detailHasDraft()) patchDetail(lot);
           else if (lot) {
-            const photo = document.getElementById('main-photo');
+            const photo = findElement('#main-photo', HTMLImageElement);
             const selected = photo && photo.getAttribute('src');
             detail(lot);
-            const restored = document.getElementById('main-photo');
+            const restored = findElement('#main-photo', HTMLImageElement);
             if (restored && selected && lot.photos.includes(selected)) restored.src = selected;
           } else
             root.innerHTML = `<div class="page"><div class="empty"><strong>${translate('lot_not_found_title')}</strong></div></div>`;
           if (oldMe && oldMe.status === 'pending' && state.me && state.me.status === 'approved')
             toast(translate('application_approved_notice'));
         }
-        if (lot && extra && state.me && state.me.admin) drawProductHistory(id, extra);
+        if (lot && extra?.kind === 'lot' && state.me && state.me.admin)
+          drawProductHistory(id, extra.data);
       } else if (route === '#/my') {
         if (!state.me && oldMe) my();
-        else if (extra && JSON.stringify([extra.bids, state.lots]) !== state.myBidsSignature)
-          drawMyBids(extra);
+        else if (
+          extra?.kind === 'my' &&
+          JSON.stringify([extra.data.bids, state.lots]) !== state.myBidsSignature
+        )
+          drawMyBids(extra.data);
       } else if (route === '#/admin') {
         if (!state.me || !state.me.admin) admin();
         else if (
           adminView === 'applications' &&
-          extra &&
+          extra?.kind === 'applications' &&
           (!state.applications ||
-            applicationSignature(extra.users) !== applicationSignature(state.applications))
+            applicationSignature(extra.data.users) !== applicationSignature(state.applications))
         )
-          drawApplications(extra);
+          drawApplications(extra.data);
         else if (adminView === 'lots' && lotsChanged) admin('lots');
-        else if (adminView === 'lot' && extra && JSON.stringify(extra) !== state.adminLotSignature)
-          adminLot(adminLotId, extra);
+        else if (
+          adminView === 'lot' &&
+          adminLotId !== null &&
+          extra?.kind === 'lot' &&
+          JSON.stringify(extra.data) !== state.adminLotSignature
+        )
+          adminLot(adminLotId, extra.data);
         else if (adminView === 'edit') {
           const lot = state.lots.find((item) => item.id === adminLotId),
-            warning = document.getElementById('live-edit-warning'),
-            save = document.querySelector(
+            warning = findElement('#live-edit-warning', HTMLElement),
+            save = findElement(
               '#edit-form button[type=submit], #edit-form button:not([type])',
+              HTMLButtonElement,
             );
           const unavailable = !lot || lot.status !== 'active' || lot.count > 0;
           if (warning) {
@@ -931,12 +1204,16 @@
   window.addEventListener('online', requestImmediateSync);
   if (tg && typeof tg.onEvent === 'function') tg.onEvent('activated', requestImmediateSync);
   window.addEventListener('hashchange', render);
-  document.getElementById('admin-link').onclick = () => {
+  requireElement('#admin-link', HTMLButtonElement).onclick = () => {
     location.hash = '#/admin';
   };
   load().then(requestImmediateSync);
-})().catch((error) => {
-  console.error('Application startup failed:', error);
-  const root = document.getElementById('app');
-  root.textContent = root.dataset.startupError;
-});
+})().catch(
+  /** @param {unknown} error Startup recovery cannot depend on the downloaded locale. */ (
+    error,
+  ) => {
+    console.error('Application startup failed:', error);
+    const root = requireElement('#app', HTMLElement);
+    root.textContent = root.dataset.startupError || '';
+  },
+);

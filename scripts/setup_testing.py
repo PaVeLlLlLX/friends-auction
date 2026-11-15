@@ -6,17 +6,67 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from auction.contracts import JSONObject, JSONValue
 from auction.i18n import translate
 from auction.telegram import TelegramError, call
 
 CONFIG = ROOT / "data" / "testing-config.json"
 
 
-def main():
+@dataclass(frozen=True)
+class SetupAccount:
+    """Validated private sender identity and optional labels shown during setup."""
+
+    user_id: int
+    first_name: str
+    last_name: str
+    username: str
+
+
+def private_start_sender(update: JSONValue) -> SetupAccount | None:
+    """Extract a human sender from a private ``/start`` update, or return ``None``.
+
+    Telegram response shapes are checked before indexing. Optional profile
+    labels are converted to strings only for local display and confirmation.
+    """
+    if not isinstance(update, dict):
+        return None
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return None
+    person, chat, text = message.get("from"), message.get("chat"), message.get("text")
+    if not isinstance(person, dict) or not isinstance(chat, dict):
+        return None
+    user_id = person.get("id")
+    if (
+        chat.get("type") != "private"
+        or type(user_id) is not int
+        or chat.get("id") != user_id
+        or person.get("is_bot")
+        or not isinstance(text, str)
+        or not (text == "/start" or text.startswith("/start "))
+    ):
+        return None
+    return SetupAccount(
+        user_id=user_id,
+        first_name=str(person.get("first_name") or ""),
+        last_name=str(person.get("last_name") or ""),
+        username=str(person.get("username") or ""),
+    )
+
+
+def main() -> int:
+    """Interactively validate a test bot and save one confirmed organizer identity.
+
+    The token is read without echo and stored with mode ``0600``. Existing
+    configuration is never overwritten. Return zero only after saving; rejected
+    input, Telegram failures and filesystem failures return one.
+    """
     os.umask(0o077)
     print(translate("setup_intro"))
     if CONFIG.exists():
@@ -33,8 +83,11 @@ def main():
         print(str(error))
         return 1
     username = bot.get("username", "") if isinstance(bot, dict) else ""
-    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+    if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
         print(translate("setup_username_unavailable"))
+        return 1
+    if not isinstance(webhook, dict):
+        print(translate("error_telegram_rejected"))
         return 1
     if webhook.get("url"):
         print(translate("setup_webhook_conflict"))
@@ -47,33 +100,20 @@ def main():
     except TelegramError as error:
         print(str(error))
         return 1
-    people = {}
+    people: dict[int, SetupAccount] = {}
     for update in updates if isinstance(updates, list) else []:
-        message = update.get("message") or {}
-        person = message.get("from") or {}
-        chat = message.get("chat") or {}
-        text = message.get("text") or ""
-        if (
-            chat.get("type") == "private"
-            and type(person.get("id")) is int
-            and chat.get("id") == person["id"]
-            and not person.get("is_bot")
-            and (text == "/start" or text.startswith("/start "))
-        ):
-            people[person["id"]] = person
+        account = private_start_sender(update)
+        if account is not None:
+            people[account.user_id] = account
     if not people:
         print(translate("setup_start_not_found"))
         return 1
     users = list(people.values())
     print(translate("setup_account_selection"))
     for i, person in enumerate(users, 1):
-        name = " ".join(str(person.get(k) or "") for k in ("first_name", "last_name")).strip()
-        label = (
-            "@" + person["username"]
-            if person.get("username")
-            else translate("setup_without_username")
-        )
-        print(f"{i}. {name} ({label}, ID {person['id']})")
+        name = " ".join((person.first_name, person.last_name)).strip()
+        label = "@" + person.username if person.username else translate("setup_without_username")
+        print(f"{i}. {name} ({label}, ID {person.user_id})")
     if len(users) == 1:
         person = users[0]
     else:
@@ -86,11 +126,11 @@ def main():
             return 1
         person = users[selected - 1]
     if input(
-        translate("setup_account_confirmation", person.get("first_name", ""), person["id"])
+        translate("setup_account_confirmation", person.first_name, person.user_id)
     ).strip().lower() not in (translate("setup_yes_short"), translate("setup_yes"), "y", "yes"):
         print(translate("setup_cancelled"))
         return 1
-    data = {"token": token, "admin_id": person["id"], "username": username}
+    data: JSONObject = {"token": token, "admin_id": person.user_id, "username": username}
     try:
         CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

@@ -1,3 +1,5 @@
+"""Auction HTTP boundary: signed identity, private approval, and serialized bids."""
+
 import hashlib
 import hmac
 import io
@@ -12,16 +14,45 @@ import time
 import urllib.parse
 import warnings
 from collections import OrderedDict
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+from typing import Literal, ParamSpec, TypeVar, cast, overload
 
-from flask import Flask, abort, g, jsonify, render_template_string, request, send_from_directory
+from flask import (
+    Flask,
+    Response,
+    abort,
+    g,
+    jsonify,
+    render_template_string,
+    request,
+    send_from_directory,
+)
+from flask.typing import ResponseReturnValue
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pillow_heif import register_heif_opener
+from werkzeug.exceptions import HTTPException
 
+from auction.contracts import JSONObject, JSONValue
 from auction.i18n import translate
+from auction.models import (
+    Candidate,
+    LotRecord,
+    PublicLot,
+    TelegramIdentity,
+    UserRecord,
+    bid_history_from_row,
+    candidate_from_row,
+    lot_from_row,
+    personal_bid_from_row,
+    user_from_row,
+)
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 ROOT = Path(__file__).resolve().parent.parent
 END = datetime(2026, 12, 12, 16, 59, tzinfo=timezone.utc).timestamp()
@@ -43,7 +74,12 @@ CREATE TABLE IF NOT EXISTS jobs (name TEXT PRIMARY KEY, completed REAL NOT NULL)
 """
 
 
-def connect(path):
+def connect(path: str | os.PathLike[str]) -> sqlite3.Connection:
+    """Open an autocommit connection with foreign keys and a bounded busy wait.
+
+    The caller owns closing it; multi-statement mutations must explicitly begin
+    and commit or roll back a transaction. SQLite failures propagate.
+    """
     db = sqlite3.connect(path, timeout=15, isolation_level=None)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
@@ -51,7 +87,13 @@ def connect(path):
     return db
 
 
-def verify_telegram(raw, token, now=None):
+def verify_telegram(raw: str, token: str, now: float | None = None) -> TelegramIdentity | None:
+    """Verify signed initData and its 24-hour age before returning a limited profile.
+
+    Malformed, duplicate, expired, or incorrectly signed input returns None.
+    Future timestamps allow up to 30 seconds of clock skew. This authenticates
+    identity only; it grants no auction role.
+    """
     if not token or not raw or len(raw) > 8192:
         return None
     try:
@@ -71,15 +113,14 @@ def verify_telegram(raw, token, now=None):
         now = time.time() if now is None else now
         if auth_date > now + 30 or now - auth_date > 86400:
             return None
-        user = json.loads(values["user"])
-        if (
-            not isinstance(user, dict)
-            or type(user.get("id")) is not int
-            or not 0 < user["id"] <= 2**63 - 1
-        ):
+        user: JSONValue = json.loads(values["user"])
+        if not isinstance(user, dict):
+            return None
+        user_id = user.get("id")
+        if type(user_id) is not int or not 0 < user_id <= 2**63 - 1:
             return None
         return {
-            "id": user["id"],
+            "id": user_id,
             "first_name": str(user.get("first_name", ""))[:100],
             "username": str(user.get("username") or "")[:64],
         }
@@ -87,7 +128,14 @@ def verify_telegram(raw, token, now=None):
         return None
 
 
-def create_app(config=None):
+def create_app(config: Mapping[str, object] | None = None) -> Flask:
+    """Build the HTTP application and initialize its configured local storage.
+
+    Config overrides environment defaults, including for isolated tests. Startup
+    creates directories and applies the additive names migration without deleting
+    existing accounts. Missing production credentials raise RuntimeError; storage
+    errors propagate. No delivery worker or external Telegram call starts here.
+    """
     app = Flask(__name__, static_folder=None)
     app.config.update(
         DB=os.environ.get("AUCTION_DB", str(ROOT / "data" / "auction.sqlite3")),
@@ -131,18 +179,21 @@ def create_app(config=None):
             db.rollback()
             raise
 
-    def database():
+    def database() -> sqlite3.Connection:
+        """Reuse one request-scoped connection, owned by the app-context teardown hook."""
         if "db" not in g:
             g.db = connect(app.config["DB"])
-        return g.db
+        return cast(sqlite3.Connection, g.db)
 
     @app.teardown_appcontext
-    def close_db(error):
+    def close_db(error: BaseException | None) -> None:
+        """Close the request connection on success or failure; ignore the teardown error."""
         if "db" in g:
             g.db.close()
 
     @app.after_request
-    def headers(resp):
+    def headers(resp: Response) -> Response:
+        """Apply browser restrictions and prevent caching personalized API responses."""
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Referrer-Policy"] = "no-referrer"
         resp.headers["Content-Security-Policy"] = (
@@ -161,17 +212,23 @@ def create_app(config=None):
     @app.errorhandler(410)
     @app.errorhandler(413)
     @app.errorhandler(429)
-    def errors(error):
+    def errors(error: HTTPException) -> ResponseReturnValue:
+        """Return API failures as JSON while preserving normal HTML error responses."""
         if request.path.startswith("/api/"):
-            return jsonify(error=error.description), error.code
+            return jsonify(error=error.description), cast(int, error.code)
         return error
 
     # Per-user and per-client limits supplement edge controls; they are not authorization.
     # Keep only bounded, current-minute entries, without clearing all limits on overflow.
-    buckets = OrderedDict()
+    buckets: OrderedDict[tuple[int, str, str], int] = OrderedDict()
     bucket_lock = threading.Lock()
 
-    def allow_rate(scope, subject, limit):
+    def allow_rate(scope: str, subject: str, limit: int) -> bool:
+        """Count one attempt in a locked, bounded per-process minute bucket.
+
+        Return False once the limit is exceeded; this is abuse control rather than
+        authentication, and does not coordinate separate web processes.
+        """
         window = int(time.monotonic() // 60)
         key = (window, scope, subject)
         with bucket_lock:
@@ -183,7 +240,12 @@ def create_app(config=None):
                 buckets.popitem(last=False)
             return count <= limit
 
-    def cloudflare_client_ip():
+    def cloudflare_client_ip() -> str | None:
+        """Trust CF-Connecting-IP only in explicit trial mode through a loopback peer.
+
+        Return None for an invalid address or an untrusted connection so ordinary
+        request addressing remains the fallback.
+        """
         # In trial mode the listener is bound to loopback behind our Cloudflare tunnel.
         # Never trust this header merely because a public client supplied it.
         if not app.config["TRIAL"]:
@@ -196,7 +258,12 @@ def create_app(config=None):
             return None
 
     @app.before_request
-    def throttle():
+    def throttle() -> None:
+        """Enforce demo isolation, retention expiry, and request/application rate limits.
+
+        Cache verified identity in the request context, but leave account approval
+        to the action handlers. Rejected requests raise localized HTTP errors.
+        """
         if app.config["DEMO"] and (
             request.host.split(":")[0] not in ("localhost", "127.0.0.1")
             or request.headers.get("X-Forwarded-For")
@@ -208,8 +275,8 @@ def create_app(config=None):
         ):
             abort(410, translate("error_retention_expired"))
         if request.path.startswith("/api/"):
-            g.verified_identity = identity()
-            user = g.verified_identity
+            user = identity()
+            g.verified_identity = user
             write = request.method not in ("GET", "HEAD", "OPTIONS")
             if user:
                 subject = str(user["id"])
@@ -228,7 +295,11 @@ def create_app(config=None):
                 ):
                     abort(429, translate("error_application_rate_limit"))
 
-    def identity():
+    def identity() -> TelegramIdentity | None:
+        """Resolve a signed identity, or an explicit local-demo role.
+
+        Do not infer organizer access or approval from a Telegram username.
+        """
         if app.config["DEMO"]:
             # Explicit demo mode only, must never be exposed on a public host.
             role = request.headers.get("X-Demo-User", "guest")
@@ -244,8 +315,23 @@ def create_app(config=None):
             request.headers.get("X-Telegram-Init-Data", ""), app.config["BOT_TOKEN"]
         )
 
-    def current_user(required=False):
-        user = g.get("verified_identity")
+    @overload
+    def current_user(required: Literal[True]) -> UserRecord:
+        """Require signed access, aborting 401 instead of returning an absent account."""
+        ...
+
+    @overload
+    def current_user(required: Literal[False] = False) -> UserRecord | None:
+        """Permit anonymous browsing while returning a private row for signed access."""
+        ...
+
+    def current_user(required: bool = False) -> UserRecord | None:
+        """Load or create the authenticated account and refresh its Telegram profile.
+
+        Application names and approval status remain untouched. Optional anonymous
+        access returns None; required anonymous access aborts with HTTP 401.
+        """
+        user = cast(TelegramIdentity | None, g.get("verified_identity"))
         if user is None:
             if required:
                 abort(401, translate("error_telegram_login_required"))
@@ -264,11 +350,14 @@ def create_app(config=None):
                 (user["username"], user["first_name"], user["id"]),
             )
             row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-        return dict(row)
+        return user_from_row(row)
 
-    def admin_required(fn):
+    def admin_required(fn: Callable[P, R]) -> Callable[P, R]:
+        """Preserve the view signature while requiring the configured organizer ID."""
+
         @wraps(fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            """Reject anonymous or non-organizer callers before invoking the wrapped view."""
             user = current_user(True)
             expected = "90001" if app.config["DEMO"] else str(app.config["ADMIN_ID"])
             if not expected or str(user["id"]) != expected:
@@ -277,35 +366,55 @@ def create_app(config=None):
 
         return wrapper
 
-    def is_admin(user):
+    def is_admin(user: UserRecord | None) -> bool:
+        """Compare the numeric account identity with the configured organizer identity."""
         return bool(
             user
             and str(user["id"]) == ("90001" if app.config["DEMO"] else str(app.config["ADMIN_ID"]))
             and (app.config["DEMO"] or app.config["ADMIN_ID"])
         )
 
-    def active_lot(lot_id):
+    def active_lot(lot_id: int) -> LotRecord:
+        """Load an existing lot or abort 404, including cancelled and ended lots.
+
+        The name does not imply bidding eligibility; mutation handlers must check
+        status and deadline themselves.
+        """
         if lot_id > 2**63 - 1:
             abort(404, translate("error_lot_not_found"))
         lot = database().execute("SELECT * FROM lots WHERE id=?", (lot_id,)).fetchone()
         if not lot:
             abort(404, translate("error_lot_not_found"))
-        return lot
+        return lot_from_row(lot)
 
-    def json_body():
+    def json_body() -> JSONObject:
+        """Require a JSON object and expose values for action-specific validation.
+
+        Nested fields remain untrusted; malformed or non-object input aborts 400.
+        """
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             abort(400, translate("error_invalid_request"))
-        return data
+        return cast(JSONObject, data)
 
-    def require_candidate(data, candidate_id):
+    def require_candidate(data: JSONObject, candidate_id: int) -> None:
+        """Reject a missing or stale selected candidate before an organizer action.
+
+        The caller must hold its mutation transaction when candidate stability is
+        required; this helper performs no locking or delivery itself.
+        """
         expected = data.get("expected_candidate_id")
         if type(expected) is not int or not 0 < expected <= 2**63 - 1:
             abort(400, translate("error_candidate_required"))
         if expected != candidate_id:
             abort(409, translate("error_candidate_changed"))
 
-    def lot_view(lot, user=None):
+    def lot_view(lot: LotRecord, user: UserRecord | None = None) -> PublicLot:
+        """Build a public lot projection without bidder identities or application names.
+
+        Personalized booleans describe only this caller. After a refusal, price and
+        leading follow the highest remaining candidate while count preserves all bids.
+        """
         db = database()
         lead = db.execute(
             "SELECT amount, user_id FROM bids WHERE lot_id=? ORDER BY amount DESC,id DESC LIMIT 1",
@@ -329,14 +438,14 @@ def create_app(config=None):
                 "SELECT 1 FROM bids WHERE lot_id=? AND user_id=? LIMIT 1", (lot["id"], user["id"])
             ).fetchone()
         )
-        refused = json.loads(lot["refused"])
-        candidate_id = lead["user_id"] if lead else None
-        price = lead["amount"] if lead else None
+        refused = cast(list[int], json.loads(lot["refused"]))
+        candidate_id = cast(int, lead["user_id"]) if lead else None
+        price = cast(int, lead["amount"]) if lead else None
         if refused:
             candidates = candidates_for(db, lot["id"], refused)
             candidate_id = candidates[0]["id"] if candidates else None
             price = candidates[0]["amount"] if candidates else None
-        return dict(
+        return PublicLot(
             id=lot["id"],
             title=lot["title"],
             description=lot["description"],
@@ -344,9 +453,10 @@ def create_app(config=None):
             start_price=lot["start_price"],
             step=lot["step"],
             price=price,
-            count=db.execute("SELECT count(*) FROM bids WHERE lot_id=?", (lot["id"],)).fetchone()[
-                0
-            ],
+            count=cast(
+                int,
+                db.execute("SELECT count(*) FROM bids WHERE lot_id=?", (lot["id"],)).fetchone()[0],
+            ),
             photos=photos,
             status="cancelled"
             if lot["status"] == "cancelled"
@@ -358,16 +468,22 @@ def create_app(config=None):
         )
 
     @app.get("/")
-    def index():
+    def index() -> str:
+        """Render the shared localized shell; catalog data is fetched through the API."""
         template = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         return render_template_string(template, translate=translate)
 
     @app.get("/assets/<path:filename>")
-    def assets(filename):
+    def assets(filename: str) -> Response:
+        """Serve a static asset using directory confinement; missing files abort 404."""
         return send_from_directory(ROOT / "static", filename)
 
     @app.get("/photos/<photo_id>")
-    def photo(photo_id):
+    def photo(photo_id: str) -> Response:
+        """Serve only a registered, reencoded JPEG; unknown photo IDs abort 404.
+
+        The request hook blocks access after retention expiry.
+        """
         row = (
             database()
             .execute(
@@ -381,7 +497,8 @@ def create_app(config=None):
         return send_from_directory(app.config["UPLOADS"], row["filename"], mimetype="image/jpeg")
 
     @app.get("/api/me")
-    def me():
+    def me() -> Response:
+        """Expose the caller profile and capabilities without private application names."""
         user = current_user()
         return jsonify(
             user={
@@ -398,7 +515,8 @@ def create_app(config=None):
         )
 
     @app.get("/api/lots")
-    def lots():
+    def lots() -> Response:
+        """List public lot projections, optionally personalized for the signed caller."""
         user = current_user()
         rows = (
             database()
@@ -407,14 +525,22 @@ def create_app(config=None):
             )
             .fetchall()
         )
-        return jsonify(lots=[lot_view(row, user) for row in rows], end=app.config["END"])
+        return jsonify(
+            lots=[lot_view(lot_from_row(row), user) for row in rows], end=app.config["END"]
+        )
 
     @app.get("/api/lots/<int:lot_id>")
-    def get_lot(lot_id):
+    def get_lot(lot_id: int) -> Response:
+        """Return one public projection or abort 404 without disclosing bidder profiles."""
         return jsonify(lot=lot_view(active_lot(lot_id), current_user()))
 
     @app.post("/api/application")
-    def application():
+    def application() -> Response:
+        """Persist private names only for a new authenticated account.
+
+        Validate both names and condition the update on new status so repeated
+        submissions preserve an existing application or organizer decision.
+        """
         user = current_user(True)
         if user["status"] == "new":
             data = json_body()
@@ -441,7 +567,13 @@ def create_app(config=None):
         )
 
     @app.post("/api/lots/<int:lot_id>/bid")
-    def bid(lot_id):
+    def bid(lot_id: int) -> Response:
+        """Record an approved caller bid and notification events in one write transaction.
+
+        Recheck approval, lot status, exact observed price, step, and strict deadline
+        under the SQLite write lock. Failures roll back the bid and subscriptions;
+        HTTP 409 reports a stale or closed auction rather than silently repricing.
+        """
         user = current_user(True)
         if user["status"] != "approved":
             abort(403, translate("error_approval_required"))
@@ -468,12 +600,12 @@ def create_app(config=None):
                 "SELECT amount,user_id FROM bids WHERE lot_id=? ORDER BY amount DESC,id DESC LIMIT 1",
                 (lot_id,),
             ).fetchone()
-            price = lead["amount"] if lead else None
+            price = cast(int, lead["amount"]) if lead else None
             if expected != price:
                 abort(409, translate("error_bid_price_changed"))
             if lead and lead["user_id"] == user["id"]:
                 abort(409, translate("error_already_leading"))
-            base = price if lead else lot["start_price"]
+            base = price if price is not None else lot["start_price"]
             minimum = base + lot["step"] if lead else base
             if amount < minimum or (amount - base) % lot["step"] != 0:
                 abort(400, translate("error_bid_step_invalid"))
@@ -510,13 +642,22 @@ def create_app(config=None):
         return jsonify(lot=lot_view(active_lot(lot_id), user))
 
     @app.post("/api/lots/<int:lot_id>/subscription")
-    def subscription(lot_id):
+    def subscription(lot_id: int) -> Response:
+        """Change only the authenticated caller notification flags.
+
+        Participation can be enabled only after that caller has bid; watching does
+        not require approval. Whitelisted flag names alone enter the SQL statement.
+        """
         user = current_user(True)
         active_lot(lot_id)
         data = json_body()
         kind = data.get("kind")
         enabled = data.get("enabled")
-        if kind not in ("watching", "participation") or type(enabled) is not bool:
+        if (
+            not isinstance(kind, str)
+            or kind not in ("watching", "participation")
+            or type(enabled) is not bool
+        ):
             abort(400, translate("error_subscription_invalid"))
         db = database()
         if (
@@ -537,18 +678,20 @@ def create_app(config=None):
         return jsonify(ok=True)
 
     @app.get("/api/my-bids")
-    def my_bids():
+    def my_bids() -> Response:
+        """Return the caller's complete bid history without other participants' profiles."""
         user = current_user(True)
         db = database()
         rows = db.execute(
             "SELECT b.id,b.amount,b.created,b.lot_id,l.title FROM bids b JOIN lots l ON l.id=b.lot_id WHERE b.user_id=? ORDER BY b.id DESC",
             (user["id"],),
         ).fetchall()
-        return jsonify(bids=[dict(x) for x in rows])
+        return jsonify(bids=[personal_bid_from_row(row) for row in rows])
 
     @app.get("/api/admin/applications")
     @admin_required
-    def admin_applications():
+    def admin_applications() -> Response:
+        """Expose application names and decisions only behind organizer authorization."""
         users = (
             database()
             .execute(
@@ -556,11 +699,15 @@ def create_app(config=None):
             )
             .fetchall()
         )
-        return jsonify(users=[dict(row) for row in users])
+        return jsonify(users=[user_from_row(row) for row in users])
 
     @app.post("/api/admin/users/<int:user_id>")
     @admin_required
-    def admin_user(user_id):
+    def admin_user(user_id: int) -> Response:
+        """Approve or reject an existing account without rewriting any prior bids.
+
+        Unknown users abort 404; decisions other than approved/rejected abort 400.
+        """
         if user_id > 2**63 - 1:
             abort(404, translate("error_application_not_found"))
         status = json_body().get("status")
@@ -573,7 +720,13 @@ def create_app(config=None):
 
     @app.post("/api/admin/lots")
     @admin_required
-    def create_lot():
+    def create_lot() -> tuple[Response, int]:
+        """Validate and reencode organizer uploads before committing a new lot.
+
+        Strip source metadata, enforce image/request bounds, and recheck closing time
+        inside the write transaction. On failure roll back rows and remove attempted
+        photo files, including partial writes; storage failures propagate.
+        """
         if time.time() >= app.config["END"]:
             abort(409, translate("error_auction_closed"))
         title = request.form.get("title", "").strip()
@@ -598,18 +751,20 @@ def create_app(config=None):
         images = request.files.getlist("photos")
         if len(images) > 6:
             abort(400, translate("error_photo_limit"))
-        prepared = []
+        prepared: list[bytes] = []
         for uploaded in images:
             if not uploaded.filename:
                 continue
             try:
-                img = Image.open(uploaded.stream)
+                img: Image.Image = Image.open(uploaded.stream)
                 if img.format not in ("JPEG", "PNG", "WEBP", "HEIF"):
                     abort(400, translate("error_photo_format"))
                 img = ImageOps.exif_transpose(img)
                 img.thumbnail((1800, 1800))
                 if img.mode != "RGB":
                     img = img.convert("RGB")
+                # JPEG comments can survive reencoding unless inherited metadata is cleared.
+                img.info.clear()
                 buffer = io.BytesIO()
                 img.save(buffer, "JPEG", quality=85, optimize=True)
                 prepared.append(buffer.getvalue())
@@ -622,7 +777,7 @@ def create_app(config=None):
             ):
                 abort(400, translate("error_photo_unreadable"))
         db = database()
-        paths = []
+        paths: list[Path] = []
         try:
             db.execute("BEGIN IMMEDIATE")
             now = time.time()
@@ -632,6 +787,7 @@ def create_app(config=None):
                 "INSERT INTO lots(title,description,condition,start_price,step,created) VALUES(?,?,?,?,?,?)",
                 (title, description, condition, start, step, now),
             ).lastrowid
+            assert lot_id is not None
             for content in prepared:
                 photo_id = secrets.token_hex(16)
                 filename = photo_id + ".jpg"
@@ -652,7 +808,13 @@ def create_app(config=None):
 
     @app.post("/api/admin/lots/<int:lot_id>")
     @admin_required
-    def admin_lot(lot_id):
+    def admin_lot(lot_id: int) -> Response:
+        """Serialize organizer cancellation, fulfillment, and candidate refusal changes.
+
+        Refusal requires closed active bidding and the exact displayed candidate;
+        it preserves bids and clears the previous candidate fulfillment state.
+        Every failure rolls back the transaction.
+        """
         data = json_body()
         action = data.get("action")
         db = database()
@@ -666,7 +828,7 @@ def create_app(config=None):
             elif action == "refuse":
                 if time.time() < app.config["END"] or lot["status"] != "active":
                     abort(409, translate("error_results_not_ready"))
-                refused = json.loads(lot["refused"])
+                refused = cast(list[int], json.loads(lot["refused"]))
                 candidates = candidates_for(db, lot_id, refused)
                 if not candidates:
                     abort(409, translate("error_no_candidates"))
@@ -686,13 +848,22 @@ def create_app(config=None):
 
     @app.post("/api/admin/lots/<int:lot_id>/edit")
     @admin_required
-    def edit_lot(lot_id):
+    def edit_lot(lot_id: int) -> Response:
+        """Update validated lot fields only before closing and before its first bid.
+
+        The eligibility check and update share a write lock so a concurrent bid
+        cannot acquire changed terms. Validation/conflict failures leave rows intact.
+        """
         data = json_body()
         title = data.get("title", "")
         description = data.get("description", "")
         condition = data.get("condition", "")
         start, step = data.get("start_price"), data.get("step")
-        if not all(isinstance(x, str) for x in (title, description, condition)):
+        if (
+            not isinstance(title, str)
+            or not isinstance(description, str)
+            or not isinstance(condition, str)
+        ):
             abort(400, translate("error_lot_description_invalid"))
         title, description, condition = title.strip(), description.strip(), condition.strip()
         if (
@@ -728,16 +899,17 @@ def create_app(config=None):
 
     @app.get("/api/admin/lots/<int:lot_id>")
     @admin_required
-    def admin_lot_detail(lot_id):
+    def admin_lot_detail(lot_id: int) -> Response:
+        """Return private candidate profiles and full bid history to the organizer only."""
         lot = active_lot(lot_id)
         db = database()
         return jsonify(
             lot=lot_view(lot),
-            candidates=candidates_for(db, lot_id, json.loads(lot["refused"])),
+            candidates=candidates_for(db, lot_id, cast(list[int], json.loads(lot["refused"]))),
             has_refusals=bool(json.loads(lot["refused"])),
             fulfillment=lot["fulfillment"],
             bids=[
-                dict(r)
+                bid_history_from_row(r)
                 for r in db.execute(
                     "SELECT b.amount,b.created,u.id,u.username,u.first_name,u.applicant_given_name,u.applicant_family_name FROM bids b JOIN users u ON u.id=b.user_id WHERE b.lot_id=? ORDER BY b.amount DESC",
                     (lot_id,),
@@ -747,11 +919,17 @@ def create_app(config=None):
 
     @app.post("/api/admin/lots/<int:lot_id>/notify-candidate")
     @admin_required
-    def notify_candidate(lot_id):
+    def notify_candidate(lot_id: int) -> Response:
+        """Send an organizer-requested offer to the explicitly selected fallback.
+
+        Only closed active lots with a recorded refusal qualify. Check the current
+        candidate before an external Telegram send; delivery failure aborts 409.
+        The send is not transactional with a simultaneous later refusal.
+        """
         lot = active_lot(lot_id)
         if time.time() < app.config["END"] or lot["status"] != "active":
             abort(409, translate("error_results_not_ready"))
-        candidates = candidates_for(database(), lot_id, json.loads(lot["refused"]))
+        candidates = candidates_for(database(), lot_id, cast(list[int], json.loads(lot["refused"])))
         if not candidates or not json.loads(lot["refused"]):
             abort(409, translate("error_fallback_not_selected"))
         require_candidate(json_body(), candidates[0]["id"])
@@ -770,9 +948,14 @@ def create_app(config=None):
     return app
 
 
-def candidates_for(db, lot_id, refused):
+def candidates_for(db: sqlite3.Connection, lot_id: int, refused: Sequence[int]) -> list[Candidate]:
+    """Rank non-refused participants by each participant's highest recorded bid.
+
+    Return private organizer-facing profiles without changing bids or approval;
+    the caller owns the connection and any transaction needed for stability.
+    """
     rows = db.execute(
         "SELECT u.id,u.username,u.first_name,u.applicant_given_name,u.applicant_family_name,MAX(b.amount) AS amount FROM bids b JOIN users u ON u.id=b.user_id WHERE b.lot_id=? GROUP BY u.id ORDER BY amount DESC",
         (lot_id,),
     ).fetchall()
-    return [dict(row) for row in rows if row["id"] not in refused]
+    return [candidate_from_row(row) for row in rows if row["id"] not in refused]

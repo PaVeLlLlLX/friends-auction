@@ -4,7 +4,7 @@ line-length = 100
 extend-exclude = ["data", ".tools"]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I"]
+select = ["E4", "E7", "E9", "F", "I", "ANN", "D100", "D101", "D102", "D103", "D104", "D107"]
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/*.py" = ["E402"]
@@ -12,3 +12,8 @@ select = ["E4", "E7", "E9", "F", "I"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["auction", "scripts", "tests", "demo.py", "run.py"]

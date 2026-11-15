@@ -3,13 +3,20 @@
 import time
 from pathlib import Path
 
+from flask import Flask
+
 from auction.app import connect, create_app
 from auction.i18n import translate
 
 ROOT = Path(__file__).resolve().parent
 
 
-def create_demo_app():
+def create_demo_app() -> Flask:
+    """Create the loopback demo and seed an empty, separate database atomically.
+
+    Real Telegram credentials and storage settings from the shell are ignored.
+    Existing lots, including edits to sample content, remain unchanged.
+    """
     app = create_app(
         {
             "DEMO": True,
@@ -62,7 +69,8 @@ def create_demo_app():
     return app
 
 
-def main():
+def main() -> None:
+    """Serve simulated demo accounts on localhost until the process is stopped."""
     create_demo_app().run(host="127.0.0.1", port=8080, debug=False, threaded=True)
 
 

@@ -3,9 +3,11 @@
   "private": true,
   "scripts": {
     "format": "prettier --write static",
-    "format:check": "prettier --check static"
+    "format:check": "prettier --check static",
+    "typecheck": "tsc --project jsconfig.json"
   },
   "devDependencies": {
-    "prettier": "3.10.1"
+    "prettier": "3.10.1",
+    "typescript": "7.0.2"
   }
 }

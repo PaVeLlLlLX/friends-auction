@@ -1023,3 +1023,103 @@ def test_product_bid_history_is_complete_and_only_for_admin(client: FlaskClient)
             and sample("second_family_name") not in public
             and "user_id" not in public
         )
+
+
+def test_delete_lot_preserves_bids_and_photos_in_private_archive(
+    app: Flask, client: FlaskClient
+) -> None:
+    """Hide an archived lot publicly while retaining accepted bids and organizer history."""
+    lot = create_lot(client)
+    approve(client, 2)
+    approve(client, 3)
+    assert bid(client, lot, 2, 0, None).status_code == 200
+    assert bid(client, lot, 3, 50, 0).status_code == 200
+    photo_id = "a" * 32
+    photo_path = Path(app.config["UPLOADS"]) / "archive-photo.jpg"
+    Image.new("RGB", (2, 2), "red").save(photo_path, "JPEG")
+    db = connect(app.config["DB"])
+    try:
+        db.execute(
+            "INSERT INTO photos(id,lot_id,filename) VALUES(?,?,?)", (photo_id, lot, photo_path.name)
+        )
+    finally:
+        db.close()
+    endpoint = f"/api/admin/lots/{lot}/delete"
+    assert client.post(endpoint, json={"expected_bid_count": 2}).status_code == 401
+    assert client.post(endpoint, headers=auth(2), json={"expected_bid_count": 2}).status_code == 403
+    assert client.post(endpoint, headers=auth(1), json={}).status_code == 400
+    assert client.post(endpoint, headers=auth(1), json={"expected_bid_count": 1}).status_code == 409
+    assert client.get(f"/api/lots/{lot}").status_code == 200
+    assert client.post(endpoint, headers=auth(1), json={"expected_bid_count": 2}).status_code == 200
+    assert json_response(client.get("/api/lots"))["lots"] == []
+    assert client.get(f"/api/lots/{lot}").status_code == 404
+    assert client.get(f"/photos/{photo_id}").status_code == 404
+    assert photo_path.exists()
+    assert bid(client, lot, 2, 100, 50).status_code == 404
+    assert (
+        client.post(
+            f"/api/lots/{lot}/subscription",
+            headers=auth(2),
+            json={"kind": "watching", "enabled": True},
+        ).status_code
+        == 404
+    )
+    mine = json_objects(json_response(client.get("/api/my-bids", headers=auth(2)))["bids"])
+    assert [entry["amount"] for entry in mine] == [0]
+    archived = json_response(client.get(f"/api/admin/lots/{lot}", headers=auth(1)))
+    assert json_object(archived["lot"])["deleted"] is True
+    assert [row["amount"] for row in json_objects(archived["bids"])] == [50, 0]
+    assert client.get("/api/admin/lots").status_code == 401
+    assert client.get("/api/admin/lots", headers=auth(2)).status_code == 403
+    listed = json_objects(json_response(client.get("/api/admin/lots", headers=auth(1)))["lots"])
+    assert len(listed) == 1 and listed[0]["deleted"] is True
+    app.config["END"] = time.time() + 1800
+    sent: list[str] = []
+
+    def sender(token: str, uid: int, message: str) -> bool:
+        """Capture unexpected notification attempts without contacting Telegram."""
+        sent.append(message)
+        return True
+
+    tick(app, time.time(), sender)
+    assert not sent
+
+
+def test_delete_and_first_bid_are_serialized(app: Flask, client: FlaskClient) -> None:
+    """Never accept a first bid and a deletion confirmed against zero bids together."""
+    lot = create_lot(client)
+    approve(client, 2)
+
+    def mutate(action: int) -> int:
+        """Submit one competing mutation through its own Flask request context."""
+        with app.test_client() as session:
+            if action == 0:
+                return session.post(
+                    f"/api/admin/lots/{lot}/delete", headers=auth(1), json={"expected_bid_count": 0}
+                ).status_code
+            return bid(session, lot, 2, 0, None).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        deleted, accepted = pool.map(mutate, [0, 1])
+    assert (deleted, accepted) in ((200, 404), (409, 200))
+
+
+def test_existing_lots_gain_archive_flag_without_losing_bids(
+    app: Flask, client: FlaskClient
+) -> None:
+    """Upgrade the previous lot schema in place while preserving accepted auction records."""
+    lot = create_lot(client)
+    approve(client, 2)
+    assert bid(client, lot, 2, 0, None).status_code == 200
+    db = connect(app.config["DB"])
+    try:
+        db.execute("ALTER TABLE lots DROP COLUMN deleted")
+    finally:
+        db.close()
+    updated = create_app(app.config)
+    new_client = updated.test_client()
+    assert json_object(json_response(new_client.get(f"/api/lots/{lot}"))["lot"])["count"] == 1
+    archived = json_object(
+        json_response(new_client.get(f"/api/admin/lots/{lot}", headers=auth(1)))["lot"]
+    )
+    assert archived["deleted"] is False

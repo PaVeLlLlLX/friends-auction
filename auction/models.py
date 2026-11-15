@@ -41,6 +41,7 @@ class LotRecord(TypedDict):
     status: Literal["active", "cancelled"]
     fulfillment: str
     refused: str
+    deleted: int
 
 
 class Candidate(TypedDict):
@@ -87,6 +88,12 @@ class PublicLot(TypedDict):
     has_bid: bool
     participation: bool
     watching: bool
+
+
+class AdminLot(PublicLot):
+    """Organizer lot projection, retaining an explicit archive marker."""
+
+    deleted: bool
 
 
 def user_from_row(row: sqlite3.Row) -> UserRecord:

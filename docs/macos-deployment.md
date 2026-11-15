@@ -20,10 +20,10 @@ Run these commands from a clone containing the release tag:
 ```sh
 git fetch --tags
 AUCTION_DEPLOY_ROOT="$HOME/Library/Application Support/Friends Auction"
-AUCTION_RELEASE_DIR="$AUCTION_DEPLOY_ROOT/releases/v1.0.0"
+AUCTION_RELEASE_DIR="$AUCTION_DEPLOY_ROOT/releases/v1.1.0"
 mkdir -p "$AUCTION_RELEASE_DIR" "$AUCTION_DEPLOY_ROOT/bin"
 chmod 700 "$AUCTION_DEPLOY_ROOT"
-git archive v1.0.0 | tar -x -C "$AUCTION_RELEASE_DIR"
+git archive v1.1.0 | tar -x -C "$AUCTION_RELEASE_DIR"
 python3.12 -m venv "$AUCTION_RELEASE_DIR/.venv"
 "$AUCTION_RELEASE_DIR/.venv/bin/python" -m pip install -r "$AUCTION_RELEASE_DIR/requirements.txt"
 install -m 700 "$(command -v cloudflared)" "$AUCTION_DEPLOY_ROOT/bin/cloudflared"

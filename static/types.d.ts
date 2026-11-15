@@ -4,7 +4,7 @@
  */
 type UserStatus = 'new' | 'pending' | 'approved' | 'rejected';
 type DemoRole = 'guest' | 'friend' | 'other' | 'admin';
-type AdminTab = 'lots' | 'applications' | 'new';
+type AdminTab = 'lots' | 'archive' | 'applications' | 'new';
 type AdminView = AdminTab | 'lot' | 'edit';
 type Fulfillment = '' | 'agreed' | 'delivered';
 
@@ -80,11 +80,18 @@ interface ApplicationsResponse {
   users: Applicant[];
 }
 interface AdminLotResponse {
-  lot: Lot;
+  lot: AdminLot;
   candidates: Candidate[];
   bids: AdminBid[];
   has_refusals: boolean;
   fulfillment: Fulfillment;
+}
+/** Archived lots remain visible only through organizer-authorized endpoints. */
+interface AdminLot extends Lot {
+  deleted: boolean;
+}
+interface AdminLotsResponse {
+  lots: AdminLot[];
 }
 interface OkResponse {
   ok: true;
@@ -99,6 +106,7 @@ interface ApiGetResponses {
   '/api/lots': LotsResponse;
   '/api/my-bids': MyBidsResponse;
   '/api/admin/applications': ApplicationsResponse;
+  '/api/admin/lots': AdminLotsResponse;
   [path: `/api/admin/lots/${number}`]: AdminLotResponse;
 }
 
@@ -122,6 +130,7 @@ interface ApiPostBodies {
     step: number;
   };
   [path: `/api/admin/lots/${number}/notify-candidate`]: { expected_candidate_id: number };
+  [path: `/api/admin/lots/${number}/delete`]: { expected_bid_count: number };
 }
 interface ApiPostResponses {
   '/api/application': { status: UserStatus };
@@ -132,6 +141,7 @@ interface ApiPostResponses {
   [path: `/api/admin/lots/${number}`]: OkResponse;
   [path: `/api/admin/lots/${number}/edit`]: OkResponse;
   [path: `/api/admin/lots/${number}/notify-candidate`]: OkResponse;
+  [path: `/api/admin/lots/${number}/delete`]: OkResponse;
 }
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -157,6 +167,8 @@ interface AppState {
   end: number;
   adminView: AdminView | null;
   adminLotId: number | null;
+  adminTarget: { id: number; edit: boolean } | null;
+  adminLotsSignature: string | null;
   applications: Applicant[] | null;
   adminLotSignature: string | null;
   myBidsSignature: string | null;
@@ -166,6 +178,7 @@ type PollExtra =
   | { kind: 'my'; data: MyBidsResponse }
   | { kind: 'applications'; data: ApplicationsResponse }
   | { kind: 'lot'; data: AdminLotResponse }
+  | { kind: 'adminLots'; data: AdminLotsResponse }
   | null;
 type DetailSnapshot = [Lot, UserStatus | null, boolean];
 

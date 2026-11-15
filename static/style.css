@@ -377,8 +377,20 @@ main {
 }
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 7px;
   margin: 20px 0;
+}
+.lot-admin-item {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.lot-admin-item > div:first-child {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+.lot-admin-tools {
+  margin-top: 20px;
 }
 .tab {
   padding: 10px 14px;

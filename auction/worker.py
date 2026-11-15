@@ -153,7 +153,7 @@ def tick(app: Flask, now: float | None = None, send: MessageSender = send_messag
                 if db.execute("SELECT 1 FROM jobs WHERE name=?", (job,)).fetchone():
                     continue
                 rows = db.execute(
-                    """SELECT e.id,e.lot_id,e.kind,l.title FROM events e JOIN lots l ON l.id=e.lot_id
+                    """SELECT e.id,e.lot_id,e.kind,l.title FROM events e JOIN lots l ON l.id=e.lot_id AND l.deleted=0
                   JOIN subscriptions s ON s.lot_id=e.lot_id AND s.user_id=e.user_id
                   WHERE e.user_id=? AND e.sent=0 AND e.created<=? AND ((e.kind='watch' AND s.watching=1) OR (e.kind='outbid' AND s.participation=1))""",
                     (user[0], now),
@@ -213,7 +213,7 @@ def tick(app: Flask, now: float | None = None, send: MessageSender = send_messag
             ).fetchall()
             for user in users:
                 rows = db.execute(
-                    """SELECT e.id,l.title FROM events e JOIN lots l ON l.id=e.lot_id JOIN subscriptions s ON s.lot_id=e.lot_id AND s.user_id=e.user_id
+                    """SELECT e.id,l.title FROM events e JOIN lots l ON l.id=e.lot_id AND l.deleted=0 JOIN subscriptions s ON s.lot_id=e.lot_id AND s.user_id=e.user_id
                     WHERE e.user_id=? AND e.sent=0 AND e.kind='outbid' AND e.created>=? AND s.participation=1""",
                     (user[0], end - 3600),
                 ).fetchall()

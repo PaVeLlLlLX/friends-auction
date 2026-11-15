@@ -103,7 +103,7 @@ function outcomeUnknown(error) {
   /** @type {Record<string, string>} */
   let messages;
   try {
-    const response = await fetch('/assets/ru.json?v=2', {
+    const response = await fetch('/assets/ru.json?v=3', {
       cache: 'no-cache',
       signal: translationController.signal,
     });
@@ -133,6 +133,8 @@ function outcomeUnknown(error) {
     end: 0,
     adminView: null,
     adminLotId: null,
+    adminTarget: null,
+    adminLotsSignature: null,
     applications: null,
     adminLotSignature: null,
     myBidsSignature: null,
@@ -498,7 +500,11 @@ function outcomeUnknown(error) {
       state.me && state.me.admin
         ? `<section class="admin-bid-history" aria-labelledby="admin-history-title"><div class="admin-history-heading"><h2 id="admin-history-title">${translate('history_title')}</h2><span>${translate('history_private_hint')}</span></div><div id="admin-bid-history" data-lot="${lot.id}" aria-live="polite"><p class="hint">${translate('history_loading')}</p></div></section>`
         : '';
-    root.innerHTML = `<div class="page"><a class="back" href="#/">${translate('nav_catalog')}</a><div class="detail-layout"><div><div class="detail-photo">${images}</div>${thumbs}</div><div class="detail"><p class="eyebrow">${translate('pickup_value')}</p><h1 id="live-title">${esc(lot.title)}</h1><p class="detail-description" id="live-description">${esc(lot.description || translate('lot_description_missing'))}</p><p class="hint" id="live-condition">${translate('lot_condition_prefix')}${esc(lot.condition || translate('lot_condition_missing'))}</p><div class="detail-info"><div><span class="small-label" id="live-price-label">${lot.price === null ? translate('price_start_label') : translate('price_current_label')}</span><strong id="live-price">${money(price)}</strong></div><div><span class="small-label">${translate('lot_end_label')}</span><strong>${translate('lot_end_date')}</strong><div class="hint">23:59 · UTC+7</div></div></div><p class="live-change" id="live-change" role="status" hidden></p>${action}${subs}${history}</div></div></div>`;
+    root.innerHTML = `<div class="page"><a class="back" href="#/">${translate('nav_catalog')}</a><div class="detail-layout"><div><div class="detail-photo">${images}</div>${thumbs}</div><div class="detail"><p class="eyebrow">${translate('pickup_value')}</p><h1 id="live-title">${esc(lot.title)}</h1><p class="detail-description" id="live-description">${esc(lot.description || translate('lot_description_missing'))}</p><p class="hint" id="live-condition">${translate('lot_condition_prefix')}${esc(lot.condition || translate('lot_condition_missing'))}</p><div class="detail-info"><div><span class="small-label" id="live-price-label">${lot.price === null ? translate('price_start_label') : translate('price_current_label')}</span><strong id="live-price">${money(price)}</strong></div><div><span class="small-label">${translate('lot_end_label')}</span><strong>${translate('lot_end_date')}</strong><div class="hint">23:59 · UTC+7</div></div></div><p class="live-change" id="live-change" role="status" hidden></p>${state.me?.admin ? `<section class="panel lot-admin-tools"><h3>${translate('lot_admin_tools')}</h3><div class="actions"><button class="button secondary" id="product-edit" ${lot.status !== 'active' || lot.count > 0 ? 'disabled' : ''}>${translate('lot_edit')}</button><button class="button danger" id="product-delete">${translate('lot_delete')}</button></div><p class="hint">${translate('lot_edit_available_hint')}</p></section>` : ''}${action}${subs}${history}</div></div></div>`;
+    const productEdit = findElement('#product-edit', HTMLButtonElement);
+    if (productEdit) productEdit.onclick = () => openLotAdmin(lot.id, true);
+    const productDelete = findElement('#product-delete', HTMLButtonElement);
+    if (productDelete) productDelete.onclick = () => removeLot(lot, productDelete);
     elements('[data-photo]', HTMLButtonElement).forEach(
       (el) =>
         (el.onclick = () => {
@@ -695,12 +701,20 @@ function outcomeUnknown(error) {
     if (button.disabled) return;
     const controls = Array.from(button.closest('.actions')?.querySelectorAll('button') || [button]);
     const disabledBefore = controls.map((control) => control.disabled);
-    const currentView = viewVersion;
+    const currentView = viewVersion,
+      currentRoute = location.hash,
+      currentRole = state.role;
     controls.forEach((control) => {
       control.disabled = true;
     });
     try {
-      await action(() => currentView === viewVersion && location.hash === '#/admin');
+      await action(
+        () =>
+          currentView === viewVersion &&
+          location.hash === currentRoute &&
+          state.role === currentRole &&
+          Boolean(state.me?.admin),
+      );
     } catch (error) {
       toast(errorMessage(error));
       if (outcomeUnknown(error)) requestImmediateSync();
@@ -715,12 +729,13 @@ function outcomeUnknown(error) {
    */
   function adminShell(tab) {
     nav('');
-    root.innerHTML = `<div class="page"><div class="admin-header"><div><p class="eyebrow">${translate('admin_kicker')}</p><h1 class="page-title">${translate('admin_title')}</h1></div><a class="back" href="#/">${translate('nav_home')}</a></div><div class="tabs"><button class="tab ${tab === 'lots' ? 'active' : ''}" data-tab="lots">${translate('admin_lots_tab')}</button><button class="tab ${tab === 'applications' ? 'active' : ''}" data-tab="applications">${translate('admin_applications_tab')}</button><button class="tab ${tab === 'new' ? 'active' : ''}" data-tab="new">${translate('admin_create_tab')}</button></div><div id="admin-content"></div></div>`;
+    root.innerHTML = `<div class="page"><div class="admin-header"><div><p class="eyebrow">${translate('admin_kicker')}</p><h1 class="page-title">${translate('admin_title')}</h1></div><a class="back" href="#/">${translate('nav_home')}</a></div><div class="tabs"><button class="tab ${tab === 'lots' ? 'active' : ''}" data-tab="lots">${translate('admin_lots_tab')}</button><button class="tab ${tab === 'archive' ? 'active' : ''}" data-tab="archive">${translate('admin_archive_tab')}</button><button class="tab ${tab === 'applications' ? 'active' : ''}" data-tab="applications">${translate('admin_applications_tab')}</button><button class="tab ${tab === 'new' ? 'active' : ''}" data-tab="new">${translate('admin_create_tab')}</button></div><div id="admin-content"></div></div>`;
     elements('[data-tab]', HTMLButtonElement).forEach(
       (b) =>
         (b.onclick = () => {
           const tab = b.dataset.tab;
-          if (tab === 'lots' || tab === 'applications' || tab === 'new') admin(tab);
+          if (tab === 'lots' || tab === 'archive' || tab === 'applications' || tab === 'new')
+            admin(tab);
         }),
     );
   }
@@ -831,22 +846,88 @@ function outcomeUnknown(error) {
       }
       return;
     }
-    box.innerHTML = state.lots.length
-      ? state.lots
+    try {
+      const data = await api('/api/admin/lots');
+      if (state.adminView === tab && findElement('#admin-content', HTMLElement) === box)
+        drawAdminLots(data, tab === 'archive');
+    } catch (error) {
+      if (findElement('#admin-content', HTMLElement) === box) box.textContent = errorMessage(error);
+    }
+  }
+  /** Open organizer controls from either a public lot or the management list.
+   * @param {number} id @param {boolean} [edit=false] @returns {void}
+   */
+  function openLotAdmin(id, edit = false) {
+    if (location.hash === '#/admin') {
+      adminLot(id, null, edit);
+      return;
+    }
+    state.adminTarget = { id, edit };
+    location.hash = '#/admin';
+  }
+  /** Archive a confirmed lot, reconciling both public and organizer snapshots afterwards.
+   * @param {Lot} lot @param {HTMLButtonElement} button @returns {Promise<void>}
+   */
+  async function removeLot(lot, button) {
+    if (!confirm(translate('lot_delete_confirm'))) return;
+    await runAdminAction(button, async (isCurrent) => {
+      const current = state.lots.find((item) => item.id === lot.id) || lot;
+      await post(`/api/admin/lots/${lot.id}/delete`, { expected_bid_count: current.count });
+      state.lots = (await api('/api/lots')).lots;
+      toast(translate('lot_deleted'));
+      if (!isCurrent()) return;
+      if (location.hash === '#/admin') await admin('lots');
+      else location.hash = '#/';
+    });
+  }
+  /** Render current or archived organizer lots, preserving the focused action during polling.
+   * @param {AdminLotsResponse} data @param {boolean} archived @returns {void}
+   */
+  function drawAdminLots(data, archived) {
+    const box = findElement('#admin-content', HTMLElement);
+    if (!box) return;
+    const focused = document.activeElement;
+    const focusedAction =
+      focused instanceof HTMLButtonElement && box.contains(focused)
+        ? [focused.dataset.manage, focused.dataset.edit, focused.dataset.delete]
+        : null;
+    state.adminLotsSignature = JSON.stringify(data);
+    const lots = data.lots.filter((lot) => lot.deleted === archived);
+    box.innerHTML = lots.length
+      ? lots
           .map(
-            (l) =>
-              `<div class="list-item"><div><strong>${esc(l.title)}</strong><small>${l.status === 'cancelled' ? translate('lot_badge_cancelled') : l.status === 'ended' ? translate('lot_badge_ended') : translate('lot_status_active')} · ${l.count}${translate('bid_count_price_separator')}${money(l.price === null ? l.start_price : l.price)}</small></div><button class="button secondary" data-manage="${l.id}">${translate('lot_open')}</button></div>`,
+            (lot) =>
+              `<div class="list-item lot-admin-item"><div><strong>${esc(lot.title)}</strong><small>${lot.deleted ? translate('lot_deleted_badge') : lot.status === 'cancelled' ? translate('lot_badge_cancelled') : lot.status === 'ended' ? translate('lot_badge_ended') : translate('lot_status_active')} · ${lot.count}${translate('bid_count_price_separator')}${money(lot.price === null ? lot.start_price : lot.price)}</small></div><div class="actions"><button class="button secondary" data-manage="${lot.id}">${translate('lot_open')}</button>${!lot.deleted ? `<button class="button secondary" data-edit="${lot.id}" ${lot.status !== 'active' || lot.count > 0 ? 'disabled' : ''}>${translate('lot_edit')}</button><button class="button danger" data-delete="${lot.id}">${translate('lot_delete')}</button>` : ''}</div></div>`,
           )
           .join('')
-      : `<div class="empty"><strong>${translate('admin_lots_empty_title')}</strong><p>${translate('admin_lots_empty_description')}</p></div>`;
+      : `<div class="empty"><strong>${translate(archived ? 'admin_archive_empty' : 'admin_lots_empty_title')}</strong></div>`;
     elements('[data-manage]', HTMLButtonElement, box).forEach(
-      (b) => (b.onclick = () => adminLot(Number(b.dataset.manage))),
+      (button) => (button.onclick = () => adminLot(Number(button.dataset.manage))),
     );
+    elements('[data-edit]', HTMLButtonElement, box).forEach(
+      (button) => (button.onclick = () => adminLot(Number(button.dataset.edit), null, true)),
+    );
+    elements('[data-delete]', HTMLButtonElement, box).forEach(
+      (button) =>
+        (button.onclick = () => {
+          const lot = lots.find((item) => item.id === Number(button.dataset.delete));
+          if (lot) removeLot(lot, button);
+        }),
+    );
+    if (focusedAction)
+      elements('button', HTMLButtonElement, box)
+        .find(
+          (button) =>
+            button.dataset.manage === focusedAction[0] &&
+            button.dataset.edit === focusedAction[1] &&
+            button.dataset.delete === focusedAction[2],
+        )
+        ?.focus({ preventScroll: true });
   }
   /** Load an organizer's lot controls and candidate snapshot, ignoring responses after route changes.
-   * @param {number} id @param {AdminLotResponse | null} [preloaded=null] @returns {Promise<void>}
+   * @param {number} id @param {AdminLotResponse | null} [preloaded=null] @param {boolean} [editRequested=false] @returns {Promise<void>}
    */
-  async function adminLot(id, preloaded = null) {
+  async function adminLot(id, preloaded = null, editRequested = false) {
     viewVersion++;
     state.adminView = 'lot';
     state.adminLotId = id;
@@ -858,8 +939,9 @@ function outcomeUnknown(error) {
       const l = data.lot;
       const box = findElement('#admin-content', HTMLElement);
       if (!box) return;
-      box.innerHTML = `<button class="back back-button" id="admin-back">${translate('nav_catalog')}</button><div class="panel"><h3>${esc(l.title)}</h3><p>${l.status === 'active' ? translate('lot_bidding_active') : l.status === 'ended' ? translate('lot_ended_title') : translate('lot_status_cancelled')} · ${l.count}${translate('bid_count_suffix')}</p><div class="actions">${l.status === 'active' && l.count === 0 ? `<button class="button secondary" id="edit-lot">${translate('lot_edit')}</button>` : ''}${l.status === 'active' ? `<button class="button danger" id="cancel-lot">${translate('lot_cancel')}</button>` : ''}${l.status === 'ended' && data.candidates.length ? `<button class="button danger" id="refuse">${translate('candidate_refuse')}</button>${data.has_refusals ? `<button class="button secondary" id="notify-candidate">${translate('candidate_notify')}</button>` : ''}<button class="button secondary" data-fulfill="agreed">${translate('fulfillment_agreed_action')}</button><button class="button secondary" data-fulfill="delivered">${translate('fulfillment_delivered_action')}</button>` : ''}</div><p>${translate('fulfillment_label')}${data.fulfillment === 'agreed' ? translate('fulfillment_agreed') : data.fulfillment === 'delivered' ? translate('fulfillment_delivered') : translate('fulfillment_unset')}</p></div><h3>${translate('candidates_title')}</h3>${data.candidates.length ? data.candidates.map((u, i) => `<div class="list-item"><span><strong>${i === 0 ? '★ ' : ''}${privateName(u)} ${u.username ? '@' + esc(u.username) : ''}</strong><small>Telegram ID: ${u.id}</small></span><strong>${money(u.amount)}</strong></div>`).join('') : `<p class="hint">${translate('candidates_empty')}</p>`}<h3>${translate('history_title')}</h3>${data.bids.map((b) => `<div class="list-item"><span>${privateName(b)} ${b.username ? '@' + esc(b.username) : ''}</span><strong>${money(b.amount)}</strong></div>`).join('')}`;
-      requireElement('#admin-back', HTMLButtonElement).onclick = () => admin('lots');
+      box.innerHTML = `<button class="back back-button" id="admin-back">${translate(l.deleted ? 'nav_archive' : 'nav_catalog')}</button><div class="panel"><h3>${esc(l.title)}</h3><p>${l.deleted ? translate('lot_archive_hint') : l.status === 'active' ? translate('lot_bidding_active') : l.status === 'ended' ? translate('lot_ended_title') : translate('lot_status_cancelled')} · ${l.count}${translate('bid_count_suffix')}</p><div class="actions">${l.status === 'active' && l.count === 0 ? `<button class="button secondary" id="edit-lot">${translate('lot_edit')}</button>` : ''}${!l.deleted ? `<button class="button danger" id="delete-lot">${translate('lot_delete')}</button>` : ''}${l.status === 'active' ? `<button class="button danger" id="cancel-lot">${translate('lot_cancel')}</button>` : ''}${l.status === 'ended' && data.candidates.length ? `<button class="button danger" id="refuse">${translate('candidate_refuse')}</button>${data.has_refusals ? `<button class="button secondary" id="notify-candidate">${translate('candidate_notify')}</button>` : ''}<button class="button secondary" data-fulfill="agreed">${translate('fulfillment_agreed_action')}</button><button class="button secondary" data-fulfill="delivered">${translate('fulfillment_delivered_action')}</button>` : ''}</div><p>${translate('fulfillment_label')}${data.fulfillment === 'agreed' ? translate('fulfillment_agreed') : data.fulfillment === 'delivered' ? translate('fulfillment_delivered') : translate('fulfillment_unset')}</p></div><h3>${translate('candidates_title')}</h3>${data.candidates.length ? data.candidates.map((u, i) => `<div class="list-item"><span><strong>${i === 0 ? '★ ' : ''}${privateName(u)} ${u.username ? '@' + esc(u.username) : ''}</strong><small>Telegram ID: ${u.id}</small></span><strong>${money(u.amount)}</strong></div>`).join('') : `<p class="hint">${translate('candidates_empty')}</p>`}<h3>${translate('history_title')}</h3>${data.bids.map((b) => `<div class="list-item"><span>${privateName(b)} ${b.username ? '@' + esc(b.username) : ''}</span><strong>${money(b.amount)}</strong></div>`).join('')}`;
+      requireElement('#admin-back', HTMLButtonElement).onclick = () =>
+        admin(l.deleted ? 'archive' : 'lots');
       const edit = findElement('#edit-lot', HTMLButtonElement);
       if (edit)
         edit.onclick = () => {
@@ -889,6 +971,8 @@ function outcomeUnknown(error) {
             );
           };
         };
+      const remove = findElement('#delete-lot', HTMLButtonElement);
+      if (remove) remove.onclick = () => removeLot(l, remove);
       const cancel = findElement('#cancel-lot', HTMLButtonElement);
       if (cancel)
         cancel.onclick = () => {
@@ -935,6 +1019,7 @@ function outcomeUnknown(error) {
               if (isCurrent()) await adminLot(id);
             })),
       );
+      if (editRequested) edit?.click();
     } catch (e) {
       toast(errorMessage(e));
     }
@@ -953,8 +1038,14 @@ function outcomeUnknown(error) {
         root.innerHTML = `<div class="page"><div class="empty"><strong>${translate('lot_not_found_title')}</strong></div></div>`;
     } else if (hash === '#/my') my();
     else if (hash === '#/about') about();
-    else if (hash === '#/admin') admin();
-    else catalog();
+    else if (hash === '#/admin') {
+      const target = state.adminTarget;
+      state.adminTarget = null;
+      if (target && state.me?.admin) {
+        adminShell('lots');
+        adminLot(target.id, null, target.edit);
+      } else admin();
+    } else catalog();
     window.scrollTo(0, 0);
   }
 
@@ -1020,6 +1111,8 @@ function outcomeUnknown(error) {
     }
     if (hint)
       hint.textContent = `${translate('bid_minimum_prefix')}${money(minimum)}${translate('bid_step_separator')}${money(lot.step)}${translate('bid_multiple_steps_hint')}`;
+    const productEdit = findElement('#product-edit', HTMLButtonElement);
+    if (productEdit) productEdit.disabled = lot.status !== 'active' || lot.count > 0;
     const watch = findElement('#watch', HTMLInputElement),
       participation = findElement('#participation', HTMLInputElement);
     if (watch) watch.checked = lot.watching;
@@ -1099,6 +1192,12 @@ function outcomeUnknown(error) {
           kind: 'lot',
           data: await api(`/api/admin/lots/${Number(route.split('/')[2])}`, options),
         };
+      if (
+        route === '#/admin' &&
+        me.user?.admin &&
+        (adminView === 'lots' || adminView === 'archive')
+      )
+        extra = { kind: 'adminLots', data: await api('/api/admin/lots', options) };
       if (route === '#/admin' && me.user && me.user.admin && adminView === 'applications')
         extra = { kind: 'applications', data: await api('/api/admin/applications', options) };
       if (
@@ -1164,7 +1263,12 @@ function outcomeUnknown(error) {
             applicationSignature(extra.data.users) !== applicationSignature(state.applications))
         )
           drawApplications(extra.data);
-        else if (adminView === 'lots' && lotsChanged) admin('lots');
+        else if (
+          (adminView === 'lots' || adminView === 'archive') &&
+          extra?.kind === 'adminLots' &&
+          JSON.stringify(extra.data) !== state.adminLotsSignature
+        )
+          drawAdminLots(extra.data, adminView === 'archive');
         else if (
           adminView === 'lot' &&
           adminLotId !== null &&

@@ -40,6 +40,7 @@ from auction import __version__
 from auction.contracts import JSONObject, JSONValue
 from auction.i18n import translate
 from auction.models import (
+    AdminLot,
     Candidate,
     LotRecord,
     PublicLot,
@@ -65,7 +66,7 @@ register_heif_opener()
 SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, first_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','pending','approved','rejected')), applicant_given_name TEXT NOT NULL DEFAULT '', applicant_family_name TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS lots (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, condition TEXT NOT NULL, start_price INTEGER NOT NULL, step INTEGER NOT NULL, created REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','cancelled')), fulfillment TEXT NOT NULL DEFAULT '', refused TEXT NOT NULL DEFAULT '[]');
+CREATE TABLE IF NOT EXISTS lots (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, condition TEXT NOT NULL, start_price INTEGER NOT NULL, step INTEGER NOT NULL, created REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','cancelled')), fulfillment TEXT NOT NULL DEFAULT '', refused TEXT NOT NULL DEFAULT '[]', deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)));
 CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY, lot_id INTEGER NOT NULL REFERENCES lots(id) ON DELETE CASCADE, filename TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS bids (id INTEGER PRIMARY KEY, lot_id INTEGER NOT NULL REFERENCES lots(id), user_id INTEGER NOT NULL REFERENCES users(id), amount INTEGER NOT NULL, created REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS bids_lot ON bids(lot_id, amount DESC, id DESC);
@@ -176,6 +177,11 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
                     db.execute(
                         "ALTER TABLE users ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''"
                     )
+            lot_columns = {column["name"] for column in db.execute("PRAGMA table_info(lots)")}
+            if "deleted" not in lot_columns:
+                db.execute(
+                    "ALTER TABLE lots ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1))"
+                )
             db.commit()
         except Exception:
             db.rollback()
@@ -376,16 +382,17 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             and (app.config["DEMO"] or app.config["ADMIN_ID"])
         )
 
-    def active_lot(lot_id: int) -> LotRecord:
+    def active_lot(lot_id: int, *, include_deleted: bool = False) -> LotRecord:
         """Load an existing lot or abort 404, including cancelled and ended lots.
 
         The name does not imply bidding eligibility; mutation handlers must check
-        status and deadline themselves.
+        status and deadline themselves. Only organizer archive handlers may set
+        ``include_deleted`` to inspect a lot removed from public access.
         """
         if lot_id > 2**63 - 1:
             abort(404, translate("error_lot_not_found"))
         lot = database().execute("SELECT * FROM lots WHERE id=?", (lot_id,)).fetchone()
-        if not lot:
+        if not lot or (lot["deleted"] and not include_deleted):
             abort(404, translate("error_lot_not_found"))
         return lot_from_row(lot)
 
@@ -489,7 +496,7 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         row = (
             database()
             .execute(
-                "SELECT p.filename FROM photos p JOIN lots l ON l.id=p.lot_id WHERE p.id=?",
+                "SELECT p.filename FROM photos p JOIN lots l ON l.id=p.lot_id WHERE p.id=? AND l.deleted=0",
                 (photo_id,),
             )
             .fetchone()
@@ -528,7 +535,7 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         rows = (
             database()
             .execute(
-                "SELECT * FROM lots ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC"
+                "SELECT * FROM lots WHERE deleted=0 ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC"
             )
             .fetchall()
         )
@@ -646,7 +653,7 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         except Exception:
             db.rollback()
             raise
-        return jsonify(lot=lot_view(active_lot(lot_id), user))
+        return jsonify(lot=lot_view(active_lot(lot_id, include_deleted=True), user))
 
     @app.post("/api/lots/<int:lot_id>/subscription")
     def subscription(lot_id: int) -> Response:
@@ -678,10 +685,14 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         db.execute(
             "INSERT OR IGNORE INTO subscriptions(lot_id,user_id) VALUES(?,?)", (lot_id, user["id"])
         )
-        db.execute(
-            "UPDATE subscriptions SET " + kind + "=? WHERE lot_id=? AND user_id=?",
-            (int(enabled), lot_id, user["id"]),
+        result = db.execute(
+            "UPDATE subscriptions SET "
+            + kind
+            + "=? WHERE lot_id=? AND user_id=? AND EXISTS(SELECT 1 FROM lots WHERE id=? AND deleted=0)",
+            (int(enabled), lot_id, user["id"], lot_id),
         )
+        if result.rowcount == 0:
+            abort(404, translate("error_lot_not_found"))
         return jsonify(ok=True)
 
     @app.get("/api/my-bids")
@@ -853,6 +864,46 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             raise
         return jsonify(ok=True)
 
+    @app.get("/api/admin/lots")
+    @admin_required
+    def admin_lots() -> Response:
+        """List live and archived lots exclusively for the organizer's management views."""
+        rows = database().execute("SELECT * FROM lots ORDER BY deleted, id DESC").fetchall()
+        projected: list[AdminLot] = []
+        for row in rows:
+            lot = lot_from_row(row)
+            projected.append(AdminLot(**lot_view(lot), deleted=bool(lot["deleted"])))
+        return jsonify(lots=projected)
+
+    @app.post("/api/admin/lots/<int:lot_id>/delete")
+    @admin_required
+    def delete_lot(lot_id: int) -> Response:
+        """Archive a lot atomically without deleting its accepted bids or photographs.
+
+        Require the organizer's observed bid count so a newly accepted bid cannot
+        be overlooked at confirmation. Archived lots reject further public access,
+        bids and edits; subscription flags are disabled in the same transaction.
+        """
+        expected = json_body().get("expected_bid_count")
+        if type(expected) is not int or expected < 0:
+            abort(400, translate("error_delete_confirmation_required"))
+        db = database()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            active_lot(lot_id)
+            count = db.execute("SELECT count(*) FROM bids WHERE lot_id=?", (lot_id,)).fetchone()[0]
+            if count != expected:
+                abort(409, translate("error_delete_bids_changed"))
+            db.execute("UPDATE lots SET deleted=1,status='cancelled' WHERE id=?", (lot_id,))
+            db.execute(
+                "UPDATE subscriptions SET participation=0,watching=0 WHERE lot_id=?", (lot_id,)
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        return jsonify(ok=True)
+
     @app.post("/api/admin/lots/<int:lot_id>/edit")
     @admin_required
     def edit_lot(lot_id: int) -> Response:
@@ -908,10 +959,10 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
     @admin_required
     def admin_lot_detail(lot_id: int) -> Response:
         """Return private candidate profiles and full bid history to the organizer only."""
-        lot = active_lot(lot_id)
+        lot = active_lot(lot_id, include_deleted=True)
         db = database()
         return jsonify(
-            lot=lot_view(lot),
+            lot=AdminLot(**lot_view(lot), deleted=bool(lot["deleted"])),
             candidates=candidates_for(db, lot_id, cast(list[int], json.loads(lot["refused"]))),
             has_refusals=bool(json.loads(lot["refused"])),
             fulfillment=lot["fulfillment"],

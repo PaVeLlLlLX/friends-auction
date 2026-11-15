@@ -1,9 +1,8 @@
 import hashlib
 import hmac
-import ipaddress
 import io
+import ipaddress
 import json
-import logging
 import os
 import re
 import secrets
@@ -11,26 +10,27 @@ import sqlite3
 import threading
 import time
 import urllib.parse
-import urllib.request
 import warnings
 from collections import OrderedDict
-from datetime import datetime, timezone, timedelta
+from contextlib import closing
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 
 from flask import Flask, abort, g, jsonify, render_template_string, request, send_from_directory
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pillow_heif import register_heif_opener
+
 from auction.i18n import translate
 
 ROOT = Path(__file__).resolve().parent.parent
 END = datetime(2026, 12, 12, 16, 59, tzinfo=timezone.utc).timestamp()
 DELETE_AFTER = datetime(2027, 1, 31, 17, 0, tzinfo=timezone.utc).timestamp()
 Image.MAX_IMAGE_PIXELS = 20_000_000
-warnings.simplefilter('error', Image.DecompressionBombWarning)
+warnings.simplefilter("error", Image.DecompressionBombWarning)
 register_heif_opener()
 
-SCHEMA = '''
+SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, first_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','pending','approved','rejected')), applicant_given_name TEXT NOT NULL DEFAULT '', applicant_family_name TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS lots (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, condition TEXT NOT NULL, start_price INTEGER NOT NULL, step INTEGER NOT NULL, created REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','cancelled')), fulfillment TEXT NOT NULL DEFAULT '', refused TEXT NOT NULL DEFAULT '[]');
@@ -40,14 +40,14 @@ CREATE INDEX IF NOT EXISTS bids_lot ON bids(lot_id, amount DESC, id DESC);
 CREATE TABLE IF NOT EXISTS subscriptions (lot_id INTEGER NOT NULL REFERENCES lots(id), user_id INTEGER NOT NULL REFERENCES users(id), participation INTEGER NOT NULL DEFAULT 0, watching INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(lot_id,user_id));
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, lot_id INTEGER NOT NULL REFERENCES lots(id), user_id INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL, created REAL NOT NULL, sent INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS jobs (name TEXT PRIMARY KEY, completed REAL NOT NULL);
-'''
+"""
 
 
 def connect(path):
     db = sqlite3.connect(path, timeout=15, isolation_level=None)
     db.row_factory = sqlite3.Row
-    db.execute('PRAGMA foreign_keys=ON')
-    db.execute('PRAGMA busy_timeout=15000')
+    db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=15000")
     return db
 
 
@@ -59,74 +59,98 @@ def verify_telegram(raw, token, now=None):
         values = dict(pairs)
         if len(values) != len(pairs):
             return None
-        supplied = values.pop('hash')
-        if not re.fullmatch(r'[0-9a-f]{64}', supplied):
+        supplied = values.pop("hash")
+        if not re.fullmatch(r"[0-9a-f]{64}", supplied):
             return None
-        check = '\n'.join(k + '=' + v for k, v in sorted(values.items()))
-        key = hmac.new(b'WebAppData', token.encode(), hashlib.sha256).digest()
+        check = "\n".join(k + "=" + v for k, v in sorted(values.items()))
+        key = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
         expected = hmac.new(key, check.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, supplied):
             return None
-        auth_date = int(values['auth_date'])
+        auth_date = int(values["auth_date"])
         now = time.time() if now is None else now
         if auth_date > now + 30 or now - auth_date > 86400:
             return None
-        user = json.loads(values['user'])
-        if not isinstance(user, dict) or type(user.get('id')) is not int or not 0 < user['id'] <= 2**63 - 1:
+        user = json.loads(values["user"])
+        if (
+            not isinstance(user, dict)
+            or type(user.get("id")) is not int
+            or not 0 < user["id"] <= 2**63 - 1
+        ):
             return None
-        return {'id': user['id'], 'first_name': str(user.get('first_name', ''))[:100], 'username': str(user.get('username') or '')[:64]}
+        return {
+            "id": user["id"],
+            "first_name": str(user.get("first_name", ""))[:100],
+            "username": str(user.get("username") or "")[:64],
+        }
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         return None
 
 
 def create_app(config=None):
     app = Flask(__name__, static_folder=None)
-    app.config.update(DB=os.environ.get('AUCTION_DB', str(ROOT / 'data' / 'auction.sqlite3')),
-                      UPLOADS=os.environ.get('AUCTION_UPLOADS', str(ROOT / 'data' / 'photos')),
-                      BOT_TOKEN=os.environ.get('TELEGRAM_BOT_TOKEN', ''),
-                      ADMIN_ID=os.environ.get('TELEGRAM_ADMIN_ID', ''),
-                      DEMO=os.environ.get('AUCTION_DEMO') == '1',
-                      TRIAL=os.environ.get('AUCTION_TRIAL') == '1',
-                      END=END, DELETE_AFTER=DELETE_AFTER, TESTING=False,
-                      MAX_CONTENT_LENGTH=36 * 1024 * 1024,
-                      MAX_FORM_MEMORY_SIZE=500 * 1024,
-                      MAX_FORM_PARTS=12)
+    app.config.update(
+        DB=os.environ.get("AUCTION_DB", str(ROOT / "data" / "auction.sqlite3")),
+        UPLOADS=os.environ.get("AUCTION_UPLOADS", str(ROOT / "data" / "photos")),
+        BOT_TOKEN=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+        ADMIN_ID=os.environ.get("TELEGRAM_ADMIN_ID", ""),
+        DEMO=os.environ.get("AUCTION_DEMO") == "1",
+        TRIAL=os.environ.get("AUCTION_TRIAL") == "1",
+        END=END,
+        DELETE_AFTER=DELETE_AFTER,
+        TESTING=False,
+        MAX_CONTENT_LENGTH=36 * 1024 * 1024,
+        MAX_FORM_MEMORY_SIZE=500 * 1024,
+        MAX_FORM_PARTS=12,
+    )
     if config:
         app.config.update(config)
-    if not app.config['TESTING'] and not app.config['DEMO'] and (not app.config['BOT_TOKEN'] or not app.config['ADMIN_ID']):
-        raise RuntimeError('TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID are required outside local demo mode.')
-    Path(app.config['DB']).parent.mkdir(parents=True, exist_ok=True)
-    Path(app.config['UPLOADS']).mkdir(parents=True, exist_ok=True)
-    with connect(app.config['DB']) as db:
+    if (
+        not app.config["TESTING"]
+        and not app.config["DEMO"]
+        and (not app.config["BOT_TOKEN"] or not app.config["ADMIN_ID"])
+    ):
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID are required outside local demo mode."
+        )
+    Path(app.config["DB"]).parent.mkdir(parents=True, exist_ok=True)
+    Path(app.config["UPLOADS"]).mkdir(parents=True, exist_ok=True)
+    with closing(connect(app.config["DB"])) as db:
         db.executescript(SCHEMA)
         # Preserve existing accounts and applications when adding the private name fields.
-        db.execute('BEGIN IMMEDIATE')
+        db.execute("BEGIN IMMEDIATE")
         try:
-            columns = {column['name'] for column in db.execute('PRAGMA table_info(users)')}
-            for column in ('applicant_given_name', 'applicant_family_name'):
+            columns = {column["name"] for column in db.execute("PRAGMA table_info(users)")}
+            for column in ("applicant_given_name", "applicant_family_name"):
                 if column not in columns:
-                    db.execute("ALTER TABLE users ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''")
+                    db.execute(
+                        "ALTER TABLE users ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''"
+                    )
             db.commit()
         except Exception:
             db.rollback()
             raise
 
     def database():
-        if 'db' not in g:
-            g.db = connect(app.config['DB'])
+        if "db" not in g:
+            g.db = connect(app.config["DB"])
         return g.db
 
     @app.teardown_appcontext
     def close_db(error):
-        if 'db' in g:
+        if "db" in g:
             g.db.close()
 
     @app.after_request
     def headers(resp):
-        resp.headers['X-Content-Type-Options'] = 'nosniff'
-        resp.headers['Referrer-Policy'] = 'no-referrer'
-        resp.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
-        resp.headers['Cache-Control'] = 'no-store' if request.path.startswith('/api/') else 'no-cache'
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["Referrer-Policy"] = "no-referrer"
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
+        )
+        resp.headers["Cache-Control"] = (
+            "no-store" if request.path.startswith("/api/") else "no-cache"
+        )
         return resp
 
     @app.errorhandler(400)
@@ -138,7 +162,7 @@ def create_app(config=None):
     @app.errorhandler(413)
     @app.errorhandler(429)
     def errors(error):
-        if request.path.startswith('/api/'):
+        if request.path.startswith("/api/"):
             return jsonify(error=error.description), error.code
         return error
 
@@ -162,281 +186,462 @@ def create_app(config=None):
     def cloudflare_client_ip():
         # In trial mode the listener is bound to loopback behind our Cloudflare tunnel.
         # Never trust this header merely because a public client supplied it.
-        if not app.config['TRIAL']:
+        if not app.config["TRIAL"]:
             return None
         try:
-            if not ipaddress.ip_address(request.remote_addr or '').is_loopback:
+            if not ipaddress.ip_address(request.remote_addr or "").is_loopback:
                 return None
-            return str(ipaddress.ip_address(request.headers.get('CF-Connecting-IP', '')))
+            return str(ipaddress.ip_address(request.headers.get("CF-Connecting-IP", "")))
         except ValueError:
             return None
 
     @app.before_request
     def throttle():
-        if app.config['DEMO'] and (request.host.split(':')[0] not in ('localhost', '127.0.0.1') or request.headers.get('X-Forwarded-For') or request.headers.get('Forwarded')):
-            abort(403, translate('api_create_app_throttle_01'))
-        if time.time() >= app.config['DELETE_AFTER'] and (request.path.startswith('/api/') or request.path.startswith('/photos/')):
-            abort(410, translate('api_create_app_throttle_02'))
-        if request.path.startswith('/api/'):
+        if app.config["DEMO"] and (
+            request.host.split(":")[0] not in ("localhost", "127.0.0.1")
+            or request.headers.get("X-Forwarded-For")
+            or request.headers.get("Forwarded")
+        ):
+            abort(403, translate("error_demo_remote_access"))
+        if time.time() >= app.config["DELETE_AFTER"] and (
+            request.path.startswith("/api/") or request.path.startswith("/photos/")
+        ):
+            abort(410, translate("error_retention_expired"))
+        if request.path.startswith("/api/"):
             g.verified_identity = identity()
             user = g.verified_identity
-            write = request.method not in ('GET', 'HEAD', 'OPTIONS')
+            write = request.method not in ("GET", "HEAD", "OPTIONS")
             if user:
-                subject = str(user['id'])
-                scope, limit = ('user-write', 90) if write else ('user-read', 300)
+                subject = str(user["id"])
+                scope, limit = ("user-write", 90) if write else ("user-read", 300)
             else:
-                subject = cloudflare_client_ip() or request.remote_addr or 'unknown'
-                scope, limit = ('guest-write', 60) if write else ('guest-read', 300)
+                subject = cloudflare_client_ip() or request.remote_addr or "unknown"
+                scope, limit = ("guest-write", 60) if write else ("guest-read", 300)
             if not allow_rate(scope, subject, limit):
-                abort(429, translate('api_create_app_throttle_03'))
+                abort(429, translate("error_rate_limit"))
             # A single connection should not create an unbounded stream of applications.
             # It never shares a bucket with administrator actions or ordinary browsing.
-            if request.path == '/api/application' and write and user:
+            if request.path == "/api/application" and write and user:
                 ip = cloudflare_client_ip()
-                if not allow_rate('application-user', subject, 5) or (ip and not allow_rate('application-ip', ip, 20)):
-                    abort(429, translate('api_create_app_throttle_04'))
+                if not allow_rate("application-user", subject, 5) or (
+                    ip and not allow_rate("application-ip", ip, 20)
+                ):
+                    abort(429, translate("error_application_rate_limit"))
 
     def identity():
-        if app.config['DEMO']:
+        if app.config["DEMO"]:
             # Explicit demo mode only, must never be exposed on a public host.
-            role = request.headers.get('X-Demo-User', 'guest')
-            sample = {'admin': (90001, 'organizer', translate('api_create_app_identity_01')), 'friend': (90002, 'friend', translate('api_create_app_identity_02')), 'other': (90003, 'another_friend', translate('api_create_app_identity_03'))}
+            role = request.headers.get("X-Demo-User", "guest")
+            sample = {
+                "admin": (90001, "organizer", translate("demo_admin_name")),
+                "friend": (90002, "friend", translate("demo_first_participant_name")),
+                "other": (90003, "another_friend", translate("demo_second_participant_name")),
+            }
             if role in sample:
                 uid, username, name = sample[role]
-                return {'id': uid, 'username': username, 'first_name': name}
-        return verify_telegram(request.headers.get('X-Telegram-Init-Data', ''), app.config['BOT_TOKEN'])
+                return {"id": uid, "username": username, "first_name": name}
+        return verify_telegram(
+            request.headers.get("X-Telegram-Init-Data", ""), app.config["BOT_TOKEN"]
+        )
 
     def current_user(required=False):
-        user = g.get('verified_identity')
+        user = g.get("verified_identity")
         if user is None:
             if required:
-                abort(401, translate('api_create_app_current_user_01'))
+                abort(401, translate("error_telegram_login_required"))
             return None
         db = database()
-        row = db.execute('SELECT * FROM users WHERE id=?', (user['id'],)).fetchone()
+        row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if row is None:
-            db.execute('INSERT INTO users(id, username, first_name) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING', (user['id'], user['username'], user['first_name']))
-            row = db.execute('SELECT * FROM users WHERE id=?', (user['id'],)).fetchone()
-        elif row['username'] != user['username'] or row['first_name'] != user['first_name']:
-            db.execute('UPDATE users SET username=?, first_name=? WHERE id=?', (user['username'], user['first_name'], user['id']))
-            row = db.execute('SELECT * FROM users WHERE id=?', (user['id'],)).fetchone()
+            db.execute(
+                "INSERT INTO users(id, username, first_name) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING",
+                (user["id"], user["username"], user["first_name"]),
+            )
+            row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        elif row["username"] != user["username"] or row["first_name"] != user["first_name"]:
+            db.execute(
+                "UPDATE users SET username=?, first_name=? WHERE id=?",
+                (user["username"], user["first_name"], user["id"]),
+            )
+            row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         return dict(row)
 
     def admin_required(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             user = current_user(True)
-            expected = '90001' if app.config['DEMO'] else str(app.config['ADMIN_ID'])
-            if not expected or str(user['id']) != expected:
-                abort(403, translate('api_create_app_admin_required_wrapper_01'))
+            expected = "90001" if app.config["DEMO"] else str(app.config["ADMIN_ID"])
+            if not expected or str(user["id"]) != expected:
+                abort(403, translate("error_access_denied"))
             return fn(*args, **kwargs)
+
         return wrapper
 
     def is_admin(user):
-        return bool(user and str(user['id']) == ('90001' if app.config['DEMO'] else str(app.config['ADMIN_ID'])) and (app.config['DEMO'] or app.config['ADMIN_ID']))
+        return bool(
+            user
+            and str(user["id"]) == ("90001" if app.config["DEMO"] else str(app.config["ADMIN_ID"]))
+            and (app.config["DEMO"] or app.config["ADMIN_ID"])
+        )
 
     def active_lot(lot_id):
         if lot_id > 2**63 - 1:
-            abort(404, translate('api_create_app_active_lot_01'))
-        lot = database().execute('SELECT * FROM lots WHERE id=?', (lot_id,)).fetchone()
+            abort(404, translate("error_lot_not_found"))
+        lot = database().execute("SELECT * FROM lots WHERE id=?", (lot_id,)).fetchone()
         if not lot:
-            abort(404, translate('api_create_app_active_lot_01'))
+            abort(404, translate("error_lot_not_found"))
         return lot
 
     def json_body():
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
-            abort(400, translate('api_create_app_json_body_01'))
+            abort(400, translate("error_invalid_request"))
         return data
+
+    def require_candidate(data, candidate_id):
+        expected = data.get("expected_candidate_id")
+        if type(expected) is not int or not 0 < expected <= 2**63 - 1:
+            abort(400, translate("error_candidate_required"))
+        if expected != candidate_id:
+            abort(409, translate("error_candidate_changed"))
 
     def lot_view(lot, user=None):
         db = database()
-        lead = db.execute('SELECT amount, user_id FROM bids WHERE lot_id=? ORDER BY amount DESC,id DESC LIMIT 1', (lot['id'],)).fetchone()
-        photos = [('/photos/' + x['id']) for x in db.execute('SELECT id FROM photos WHERE lot_id=? ORDER BY rowid', (lot['id'],))]
-        sub = db.execute('SELECT participation, watching FROM subscriptions WHERE lot_id=? AND user_id=?', (lot['id'], user['id'])).fetchone() if user else None
-        has_bid = bool(user and db.execute('SELECT 1 FROM bids WHERE lot_id=? AND user_id=? LIMIT 1', (lot['id'], user['id'])).fetchone())
-        refused = json.loads(lot['refused'])
-        return dict(id=lot['id'], title=lot['title'], description=lot['description'], condition=lot['condition'], start_price=lot['start_price'], step=lot['step'], price=lead['amount'] if lead else None, count=db.execute('SELECT count(*) FROM bids WHERE lot_id=?', (lot['id'],)).fetchone()[0], photos=photos, status='cancelled' if lot['status']=='cancelled' else ('ended' if time.time() >= app.config['END'] else 'active'), leading=bool(lead and user and lead['user_id']==user['id'] and user['id'] not in refused), has_bid=has_bid, participation=bool(sub and sub['participation']), watching=bool(sub and sub['watching']))
+        lead = db.execute(
+            "SELECT amount, user_id FROM bids WHERE lot_id=? ORDER BY amount DESC,id DESC LIMIT 1",
+            (lot["id"],),
+        ).fetchone()
+        photos = [
+            ("/photos/" + x["id"])
+            for x in db.execute("SELECT id FROM photos WHERE lot_id=? ORDER BY rowid", (lot["id"],))
+        ]
+        sub = (
+            db.execute(
+                "SELECT participation, watching FROM subscriptions WHERE lot_id=? AND user_id=?",
+                (lot["id"], user["id"]),
+            ).fetchone()
+            if user
+            else None
+        )
+        has_bid = bool(
+            user
+            and db.execute(
+                "SELECT 1 FROM bids WHERE lot_id=? AND user_id=? LIMIT 1", (lot["id"], user["id"])
+            ).fetchone()
+        )
+        refused = json.loads(lot["refused"])
+        candidate_id = lead["user_id"] if lead else None
+        price = lead["amount"] if lead else None
+        if refused:
+            candidates = candidates_for(db, lot["id"], refused)
+            candidate_id = candidates[0]["id"] if candidates else None
+            price = candidates[0]["amount"] if candidates else None
+        return dict(
+            id=lot["id"],
+            title=lot["title"],
+            description=lot["description"],
+            condition=lot["condition"],
+            start_price=lot["start_price"],
+            step=lot["step"],
+            price=price,
+            count=db.execute("SELECT count(*) FROM bids WHERE lot_id=?", (lot["id"],)).fetchone()[
+                0
+            ],
+            photos=photos,
+            status="cancelled"
+            if lot["status"] == "cancelled"
+            else ("ended" if time.time() >= app.config["END"] else "active"),
+            leading=bool(user and candidate_id == user["id"] and lot["status"] == "active"),
+            has_bid=has_bid,
+            participation=bool(sub and sub["participation"]),
+            watching=bool(sub and sub["watching"]),
+        )
 
-    @app.get('/')
+    @app.get("/")
     def index():
-        template = (ROOT / 'static' / 'index.html').read_text(encoding='utf-8')
+        template = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         return render_template_string(template, translate=translate)
 
-    @app.get('/assets/<path:filename>')
+    @app.get("/assets/<path:filename>")
     def assets(filename):
-        return send_from_directory(ROOT / 'static', filename)
+        return send_from_directory(ROOT / "static", filename)
 
-    @app.get('/photos/<photo_id>')
+    @app.get("/photos/<photo_id>")
     def photo(photo_id):
-        row = database().execute('SELECT p.filename FROM photos p JOIN lots l ON l.id=p.lot_id WHERE p.id=?', (photo_id,)).fetchone()
+        row = (
+            database()
+            .execute(
+                "SELECT p.filename FROM photos p JOIN lots l ON l.id=p.lot_id WHERE p.id=?",
+                (photo_id,),
+            )
+            .fetchone()
+        )
         if not row:
             abort(404)
-        return send_from_directory(app.config['UPLOADS'], row['filename'], mimetype='image/jpeg')
+        return send_from_directory(app.config["UPLOADS"], row["filename"], mimetype="image/jpeg")
 
-    @app.get('/api/me')
+    @app.get("/api/me")
     def me():
         user = current_user()
-        return jsonify(user={'first_name': user['first_name'], 'username': user['username'], 'status': user['status'], 'admin': is_admin(user)} if user else None, end=app.config['END'], demo=app.config['DEMO'], trial=app.config['TRIAL'])
+        return jsonify(
+            user={
+                "first_name": user["first_name"],
+                "username": user["username"],
+                "status": user["status"],
+                "admin": is_admin(user),
+            }
+            if user
+            else None,
+            end=app.config["END"],
+            demo=app.config["DEMO"],
+            trial=app.config["TRIAL"],
+        )
 
-    @app.get('/api/lots')
+    @app.get("/api/lots")
     def lots():
         user = current_user()
-        rows = database().execute("SELECT * FROM lots ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC").fetchall()
-        return jsonify(lots=[lot_view(row, user) for row in rows], end=app.config['END'])
+        rows = (
+            database()
+            .execute(
+                "SELECT * FROM lots ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC"
+            )
+            .fetchall()
+        )
+        return jsonify(lots=[lot_view(row, user) for row in rows], end=app.config["END"])
 
-    @app.get('/api/lots/<int:lot_id>')
+    @app.get("/api/lots/<int:lot_id>")
     def get_lot(lot_id):
         return jsonify(lot=lot_view(active_lot(lot_id), current_user()))
 
-    @app.post('/api/application')
+    @app.post("/api/application")
     def application():
         user = current_user(True)
-        if user['status'] == 'new':
+        if user["status"] == "new":
             data = json_body()
-            given = data.get('given_name')
-            family = data.get('family_name')
+            given = data.get("given_name")
+            family = data.get("family_name")
             if not isinstance(given, str) or not isinstance(family, str):
-                abort(400, translate('api_create_app_application_01'))
+                abort(400, translate("error_names_required"))
             given, family = given.strip(), family.strip()
-            if any(len(name) > 100 or not any(char.isalpha() for char in name) or any(ord(char) < 32 or ord(char) == 127 for char in name) for name in (given, family)):
-                abort(400, translate('api_create_app_application_02'))
-            database().execute("UPDATE users SET status='pending', applicant_given_name=?, applicant_family_name=? WHERE id=? AND status='new'", (given, family, user['id']))
-        return jsonify(status=database().execute('SELECT status FROM users WHERE id=?', (user['id'],)).fetchone()['status'])
+            if any(
+                len(name) > 100
+                or not any(char.isalpha() for char in name)
+                or any(ord(char) < 32 or ord(char) == 127 for char in name)
+                for name in (given, family)
+            ):
+                abort(400, translate("error_names_invalid"))
+            database().execute(
+                "UPDATE users SET status='pending', applicant_given_name=?, applicant_family_name=? WHERE id=? AND status='new'",
+                (given, family, user["id"]),
+            )
+        return jsonify(
+            status=database()
+            .execute("SELECT status FROM users WHERE id=?", (user["id"],))
+            .fetchone()["status"]
+        )
 
-    @app.post('/api/lots/<int:lot_id>/bid')
+    @app.post("/api/lots/<int:lot_id>/bid")
     def bid(lot_id):
         user = current_user(True)
-        if user['status'] != 'approved':
-            abort(403, translate('api_create_app_bid_01'))
+        if user["status"] != "approved":
+            abort(403, translate("error_approval_required"))
         payload = json_body()
-        amount = payload.get('amount')
-        expected = payload.get('expected_price')
-        if type(amount) is not int or amount < 0 or amount > 100_000_000 or (expected is not None and type(expected) is not int):
-            abort(400, translate('api_create_app_bid_02'))
+        amount = payload.get("amount")
+        expected = payload.get("expected_price")
+        if (
+            type(amount) is not int
+            or amount < 0
+            or amount > 100_000_000
+            or (expected is not None and type(expected) is not int)
+        ):
+            abort(400, translate("error_bid_amount_invalid"))
         db = database()
-        db.execute('BEGIN IMMEDIATE')
+        db.execute("BEGIN IMMEDIATE")
         try:
-            current = db.execute('SELECT status FROM users WHERE id=?', (user['id'],)).fetchone()
-            if not current or current['status'] != 'approved':
-                abort(403, translate('api_create_app_bid_01'))
+            current = db.execute("SELECT status FROM users WHERE id=?", (user["id"],)).fetchone()
+            if not current or current["status"] != "approved":
+                abort(403, translate("error_approval_required"))
             lot = active_lot(lot_id)
-            if lot['status'] != 'active' or time.time() >= app.config['END']:
-                abort(409, translate('api_create_app_bid_03'))
-            lead = db.execute('SELECT amount,user_id FROM bids WHERE lot_id=? ORDER BY amount DESC,id DESC LIMIT 1', (lot_id,)).fetchone()
-            price = lead['amount'] if lead else None
+            if lot["status"] != "active" or time.time() >= app.config["END"]:
+                abort(409, translate("error_bidding_closed"))
+            lead = db.execute(
+                "SELECT amount,user_id FROM bids WHERE lot_id=? ORDER BY amount DESC,id DESC LIMIT 1",
+                (lot_id,),
+            ).fetchone()
+            price = lead["amount"] if lead else None
             if expected != price:
-                abort(409, translate('api_create_app_bid_04'))
-            if lead and lead['user_id'] == user['id']:
-                abort(409, translate('api_create_app_bid_05'))
-            base = price if lead else lot['start_price']
-            minimum = base + lot['step'] if lead else base
-            if amount < minimum or (amount - base) % lot['step'] != 0:
-                abort(400, translate('api_create_app_bid_06'))
+                abort(409, translate("error_bid_price_changed"))
+            if lead and lead["user_id"] == user["id"]:
+                abort(409, translate("error_already_leading"))
+            base = price if lead else lot["start_price"]
+            minimum = base + lot["step"] if lead else base
+            if amount < minimum or (amount - base) % lot["step"] != 0:
+                abort(400, translate("error_bid_step_invalid"))
             now = time.time()
-            db.execute('INSERT INTO bids(lot_id,user_id,amount,created) VALUES(?,?,?,?)', (lot_id,user['id'],amount,now))
-            db.execute('INSERT INTO subscriptions(lot_id,user_id,participation,watching) VALUES(?,?,1,0) ON CONFLICT(lot_id,user_id) DO UPDATE SET participation=1', (lot_id,user['id']))
-            watchers = db.execute('SELECT user_id, participation, watching FROM subscriptions WHERE lot_id=? AND user_id!=?', (lot_id,user['id'])).fetchall()
+            if now >= app.config["END"]:
+                abort(409, translate("error_bidding_closed"))
+            db.execute(
+                "INSERT INTO bids(lot_id,user_id,amount,created) VALUES(?,?,?,?)",
+                (lot_id, user["id"], amount, now),
+            )
+            db.execute(
+                "INSERT INTO subscriptions(lot_id,user_id,participation,watching) VALUES(?,?,1,0) ON CONFLICT(lot_id,user_id) DO UPDATE SET participation=1",
+                (lot_id, user["id"]),
+            )
+            watchers = db.execute(
+                "SELECT user_id, participation, watching FROM subscriptions WHERE lot_id=? AND user_id!=?",
+                (lot_id, user["id"]),
+            ).fetchall()
             for watcher in watchers:
-                if lead and watcher['user_id']==lead['user_id'] and watcher['participation']:
-                    db.execute("INSERT INTO events(lot_id,user_id,kind,created) VALUES(?,?,'outbid',?)", (lot_id,watcher['user_id'],now))
-                if watcher['watching']:
-                    db.execute("INSERT INTO events(lot_id,user_id,kind,created) VALUES(?,?,'watch',?)", (lot_id,watcher['user_id'],now))
+                if lead and watcher["user_id"] == lead["user_id"] and watcher["participation"]:
+                    db.execute(
+                        "INSERT INTO events(lot_id,user_id,kind,created) VALUES(?,?,'outbid',?)",
+                        (lot_id, watcher["user_id"], now),
+                    )
+                if watcher["watching"]:
+                    db.execute(
+                        "INSERT INTO events(lot_id,user_id,kind,created) VALUES(?,?,'watch',?)",
+                        (lot_id, watcher["user_id"], now),
+                    )
             db.commit()
         except Exception:
             db.rollback()
             raise
         return jsonify(lot=lot_view(active_lot(lot_id), user))
 
-    @app.post('/api/lots/<int:lot_id>/subscription')
+    @app.post("/api/lots/<int:lot_id>/subscription")
     def subscription(lot_id):
         user = current_user(True)
         active_lot(lot_id)
         data = json_body()
-        kind = data.get('kind')
-        enabled = data.get('enabled')
-        if kind not in ('watching', 'participation') or type(enabled) is not bool:
-            abort(400, translate('api_create_app_subscription_01'))
+        kind = data.get("kind")
+        enabled = data.get("enabled")
+        if kind not in ("watching", "participation") or type(enabled) is not bool:
+            abort(400, translate("error_subscription_invalid"))
         db = database()
-        if kind == 'participation' and enabled and not db.execute('SELECT 1 FROM bids WHERE lot_id=? AND user_id=?', (lot_id, user['id'])).fetchone():
-            abort(400, translate('api_create_app_subscription_02'))
-        db.execute('INSERT OR IGNORE INTO subscriptions(lot_id,user_id) VALUES(?,?)', (lot_id,user['id']))
-        db.execute('UPDATE subscriptions SET ' + kind + '=? WHERE lot_id=? AND user_id=?', (int(enabled), lot_id, user['id']))
+        if (
+            kind == "participation"
+            and enabled
+            and not db.execute(
+                "SELECT 1 FROM bids WHERE lot_id=? AND user_id=?", (lot_id, user["id"])
+            ).fetchone()
+        ):
+            abort(400, translate("error_participation_requires_bid"))
+        db.execute(
+            "INSERT OR IGNORE INTO subscriptions(lot_id,user_id) VALUES(?,?)", (lot_id, user["id"])
+        )
+        db.execute(
+            "UPDATE subscriptions SET " + kind + "=? WHERE lot_id=? AND user_id=?",
+            (int(enabled), lot_id, user["id"]),
+        )
         return jsonify(ok=True)
 
-    @app.get('/api/my-bids')
+    @app.get("/api/my-bids")
     def my_bids():
         user = current_user(True)
         db = database()
-        rows = db.execute('SELECT b.id,b.amount,b.created,b.lot_id,l.title FROM bids b JOIN lots l ON l.id=b.lot_id WHERE b.user_id=? ORDER BY b.id DESC', (user['id'],)).fetchall()
+        rows = db.execute(
+            "SELECT b.id,b.amount,b.created,b.lot_id,l.title FROM bids b JOIN lots l ON l.id=b.lot_id WHERE b.user_id=? ORDER BY b.id DESC",
+            (user["id"],),
+        ).fetchall()
         return jsonify(bids=[dict(x) for x in rows])
 
-    @app.get('/api/admin/applications')
+    @app.get("/api/admin/applications")
     @admin_required
     def admin_applications():
-        users = database().execute("SELECT id,username,first_name,status,applicant_given_name,applicant_family_name FROM users WHERE status!='new' ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC").fetchall()
+        users = (
+            database()
+            .execute(
+                "SELECT id,username,first_name,status,applicant_given_name,applicant_family_name FROM users WHERE status!='new' ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC"
+            )
+            .fetchall()
+        )
         return jsonify(users=[dict(row) for row in users])
 
-    @app.post('/api/admin/users/<int:user_id>')
+    @app.post("/api/admin/users/<int:user_id>")
     @admin_required
     def admin_user(user_id):
         if user_id > 2**63 - 1:
-            abort(404, translate('api_create_app_admin_user_01'))
-        status = json_body().get('status')
-        if status not in ('approved','rejected'):
-            abort(400, translate('api_create_app_admin_user_02'))
-        result = database().execute('UPDATE users SET status=? WHERE id=?', (status,user_id))
+            abort(404, translate("error_application_not_found"))
+        status = json_body().get("status")
+        if status not in ("approved", "rejected"):
+            abort(400, translate("error_application_decision_invalid"))
+        result = database().execute("UPDATE users SET status=? WHERE id=?", (status, user_id))
         if result.rowcount == 0:
-            abort(404, translate('api_create_app_admin_user_01'))
+            abort(404, translate("error_application_not_found"))
         return jsonify(ok=True)
 
-    @app.post('/api/admin/lots')
+    @app.post("/api/admin/lots")
     @admin_required
     def create_lot():
-        if time.time() >= app.config['END']:
-            abort(409, translate('api_create_app_create_lot_01'))
-        title = request.form.get('title','').strip()
-        description = request.form.get('description','').strip()
-        condition = request.form.get('condition','').strip()
+        if time.time() >= app.config["END"]:
+            abort(409, translate("error_auction_closed"))
+        title = request.form.get("title", "").strip()
+        description = request.form.get("description", "").strip()
+        condition = request.form.get("condition", "").strip()
         try:
-            start = int(request.form.get('start_price',''))
-            step = int(request.form.get('step',''))
+            start = int(request.form.get("start_price", ""))
+            step = int(request.form.get("step", ""))
         except ValueError:
-            abort(400, translate('api_create_app_create_lot_02'))
-        if not title or len(title)>120 or len(description)>3000 or len(condition)>120 or start < 0 or start > 100_000_000 or step < 1 or step > 100_000_000:
-            abort(400, translate('api_create_app_create_lot_03'))
-        images = request.files.getlist('photos')
+            abort(400, translate("error_lot_price_invalid"))
+        if (
+            not title
+            or len(title) > 120
+            or len(description) > 3000
+            or len(condition) > 120
+            or start < 0
+            or start > 100_000_000
+            or step < 1
+            or step > 100_000_000
+        ):
+            abort(400, translate("error_lot_fields_invalid"))
+        images = request.files.getlist("photos")
         if len(images) > 6:
-            abort(400, translate('api_create_app_create_lot_04'))
+            abort(400, translate("error_photo_limit"))
         prepared = []
         for uploaded in images:
             if not uploaded.filename:
                 continue
             try:
                 img = Image.open(uploaded.stream)
-                if img.format not in ('JPEG', 'PNG', 'WEBP', 'HEIF'):
-                    abort(400, translate('api_create_app_create_lot_05'))
+                if img.format not in ("JPEG", "PNG", "WEBP", "HEIF"):
+                    abort(400, translate("error_photo_format"))
                 img = ImageOps.exif_transpose(img)
                 img.thumbnail((1800, 1800))
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
                 buffer = io.BytesIO()
-                img.save(buffer, 'JPEG', quality=85, optimize=True)
+                img.save(buffer, "JPEG", quality=85, optimize=True)
                 prepared.append(buffer.getvalue())
-            except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
-                abort(400, translate('api_create_app_create_lot_06'))
+            except (
+                UnidentifiedImageError,
+                OSError,
+                ValueError,
+                Image.DecompressionBombError,
+                Image.DecompressionBombWarning,
+            ):
+                abort(400, translate("error_photo_unreadable"))
         db = database()
         paths = []
         try:
-            db.execute('BEGIN IMMEDIATE')
-            lot_id = db.execute('INSERT INTO lots(title,description,condition,start_price,step,created) VALUES(?,?,?,?,?,?)', (title,description,condition,start,step,time.time())).lastrowid
+            db.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            if now >= app.config["END"]:
+                abort(409, translate("error_auction_closed"))
+            lot_id = db.execute(
+                "INSERT INTO lots(title,description,condition,start_price,step,created) VALUES(?,?,?,?,?,?)",
+                (title, description, condition, start, step, now),
+            ).lastrowid
             for content in prepared:
                 photo_id = secrets.token_hex(16)
-                filename = photo_id + '.jpg'
-                path = Path(app.config['UPLOADS']) / filename
-                path.write_bytes(content)
+                filename = photo_id + ".jpg"
+                path = Path(app.config["UPLOADS"]) / filename
                 paths.append(path)
-                db.execute('INSERT INTO photos(id,lot_id,filename) VALUES(?,?,?)', (photo_id,lot_id,filename))
+                path.write_bytes(content)
+                db.execute(
+                    "INSERT INTO photos(id,lot_id,filename) VALUES(?,?,?)",
+                    (photo_id, lot_id, filename),
+                )
             db.commit()
         except Exception:
             db.rollback()
@@ -445,80 +650,129 @@ def create_app(config=None):
             raise
         return jsonify(lot=lot_view(active_lot(lot_id))), 201
 
-    @app.post('/api/admin/lots/<int:lot_id>')
+    @app.post("/api/admin/lots/<int:lot_id>")
     @admin_required
     def admin_lot(lot_id):
-        lot = active_lot(lot_id)
         data = json_body()
-        action = data.get('action')
+        action = data.get("action")
         db = database()
-        if action == 'cancel':
-            db.execute("UPDATE lots SET status='cancelled' WHERE id=?", (lot_id,))
-        elif action in ('agreed','delivered',''):
-            db.execute('UPDATE lots SET fulfillment=? WHERE id=?', (action,lot_id))
-        elif action == 'refuse':
-            if time.time() < app.config['END'] or lot['status'] != 'active':
-                abort(409, translate('api_create_app_admin_lot_01'))
-            refused = json.loads(lot['refused'])
-            candidates = candidates_for(db,lot_id,refused)
-            if not candidates:
-                abort(409, translate('api_create_app_admin_lot_02'))
-            refused.append(candidates[0]['id'])
-            db.execute('UPDATE lots SET refused=? WHERE id=?', (json.dumps(refused),lot_id))
-        else:
-            abort(400, translate('api_create_app_admin_lot_03'))
-        return jsonify(ok=True)
-
-    @app.post('/api/admin/lots/<int:lot_id>/edit')
-    @admin_required
-    def edit_lot(lot_id):
-        data = json_body()
-        title = data.get('title', '')
-        description = data.get('description', '')
-        condition = data.get('condition', '')
-        start, step = data.get('start_price'), data.get('step')
-        if not all(isinstance(x, str) for x in (title, description, condition)):
-            abort(400, translate('api_create_app_edit_lot_01'))
-        title, description, condition = title.strip(), description.strip(), condition.strip()
-        if not title or len(title)>120 or len(description)>3000 or len(condition)>120 or type(start) is not int or type(step) is not int or not 0 <= start <= 100_000_000 or not 1 <= step <= 100_000_000:
-            abort(400, translate('api_create_app_create_lot_03'))
-        db = database()
-        db.execute('BEGIN IMMEDIATE')
+        db.execute("BEGIN IMMEDIATE")
         try:
             lot = active_lot(lot_id)
-            if lot['status'] != 'active' or time.time() >= app.config['END'] or db.execute('SELECT 1 FROM bids WHERE lot_id=? LIMIT 1', (lot_id,)).fetchone():
-                abort(409, translate('api_create_app_edit_lot_02'))
-            db.execute('UPDATE lots SET title=?,description=?,condition=?,start_price=?,step=? WHERE id=?', (title,description,condition,start,step,lot_id))
+            if action == "cancel":
+                db.execute("UPDATE lots SET status='cancelled' WHERE id=?", (lot_id,))
+            elif action in ("agreed", "delivered", ""):
+                db.execute("UPDATE lots SET fulfillment=? WHERE id=?", (action, lot_id))
+            elif action == "refuse":
+                if time.time() < app.config["END"] or lot["status"] != "active":
+                    abort(409, translate("error_results_not_ready"))
+                refused = json.loads(lot["refused"])
+                candidates = candidates_for(db, lot_id, refused)
+                if not candidates:
+                    abort(409, translate("error_no_candidates"))
+                require_candidate(data, candidates[0]["id"])
+                refused.append(candidates[0]["id"])
+                db.execute(
+                    "UPDATE lots SET refused=?, fulfillment='' WHERE id=?",
+                    (json.dumps(refused), lot_id),
+                )
+            else:
+                abort(400, translate("error_lot_action_invalid"))
             db.commit()
         except Exception:
             db.rollback()
             raise
         return jsonify(ok=True)
 
-    @app.get('/api/admin/lots/<int:lot_id>')
+    @app.post("/api/admin/lots/<int:lot_id>/edit")
+    @admin_required
+    def edit_lot(lot_id):
+        data = json_body()
+        title = data.get("title", "")
+        description = data.get("description", "")
+        condition = data.get("condition", "")
+        start, step = data.get("start_price"), data.get("step")
+        if not all(isinstance(x, str) for x in (title, description, condition)):
+            abort(400, translate("error_lot_description_invalid"))
+        title, description, condition = title.strip(), description.strip(), condition.strip()
+        if (
+            not title
+            or len(title) > 120
+            or len(description) > 3000
+            or len(condition) > 120
+            or type(start) is not int
+            or type(step) is not int
+            or not 0 <= start <= 100_000_000
+            or not 1 <= step <= 100_000_000
+        ):
+            abort(400, translate("error_lot_fields_invalid"))
+        db = database()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            lot = active_lot(lot_id)
+            if (
+                lot["status"] != "active"
+                or time.time() >= app.config["END"]
+                or db.execute("SELECT 1 FROM bids WHERE lot_id=? LIMIT 1", (lot_id,)).fetchone()
+            ):
+                abort(409, translate("error_lot_edit_locked"))
+            db.execute(
+                "UPDATE lots SET title=?,description=?,condition=?,start_price=?,step=? WHERE id=?",
+                (title, description, condition, start, step, lot_id),
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        return jsonify(ok=True)
+
+    @app.get("/api/admin/lots/<int:lot_id>")
     @admin_required
     def admin_lot_detail(lot_id):
         lot = active_lot(lot_id)
         db = database()
-        return jsonify(lot=lot_view(lot), candidates=candidates_for(db,lot_id,json.loads(lot['refused'])), has_refusals=bool(json.loads(lot['refused'])), fulfillment=lot['fulfillment'], bids=[dict(r) for r in db.execute('SELECT b.amount,b.created,u.id,u.username,u.first_name,u.applicant_given_name,u.applicant_family_name FROM bids b JOIN users u ON u.id=b.user_id WHERE b.lot_id=? ORDER BY b.amount DESC', (lot_id,))])
+        return jsonify(
+            lot=lot_view(lot),
+            candidates=candidates_for(db, lot_id, json.loads(lot["refused"])),
+            has_refusals=bool(json.loads(lot["refused"])),
+            fulfillment=lot["fulfillment"],
+            bids=[
+                dict(r)
+                for r in db.execute(
+                    "SELECT b.amount,b.created,u.id,u.username,u.first_name,u.applicant_given_name,u.applicant_family_name FROM bids b JOIN users u ON u.id=b.user_id WHERE b.lot_id=? ORDER BY b.amount DESC",
+                    (lot_id,),
+                )
+            ],
+        )
 
-    @app.post('/api/admin/lots/<int:lot_id>/notify-candidate')
+    @app.post("/api/admin/lots/<int:lot_id>/notify-candidate")
     @admin_required
     def notify_candidate(lot_id):
         lot = active_lot(lot_id)
-        if time.time() < app.config['END'] or lot['status'] != 'active':
-            abort(409, translate('api_create_app_admin_lot_01'))
-        candidates = candidates_for(database(), lot_id, json.loads(lot['refused']))
-        if not candidates or not json.loads(lot['refused']):
-            abort(409, translate('api_create_app_notify_candidate_01'))
+        if time.time() < app.config["END"] or lot["status"] != "active":
+            abort(409, translate("error_results_not_ready"))
+        candidates = candidates_for(database(), lot_id, json.loads(lot["refused"]))
+        if not candidates or not json.loads(lot["refused"]):
+            abort(409, translate("error_fallback_not_selected"))
+        require_candidate(json_body(), candidates[0]["id"])
         from auction.worker import send_message
-        if not send_message(app.config['BOT_TOKEN'], candidates[0]['id'], translate('api_create_app_notify_candidate_02') + lot['title'] + translate('api_create_app_notify_candidate_03')):
-            abort(409, translate('api_create_app_notify_candidate_04'))
+
+        if not send_message(
+            app.config["BOT_TOKEN"],
+            candidates[0]["id"],
+            translate("notification_candidate_offer_prefix")
+            + lot["title"]
+            + translate("notification_candidate_offer_suffix"),
+        ):
+            abort(409, translate("error_notification_delivery"))
         return jsonify(ok=True)
 
     return app
 
 
 def candidates_for(db, lot_id, refused):
-    rows = db.execute('SELECT u.id,u.username,u.first_name,u.applicant_given_name,u.applicant_family_name,MAX(b.amount) AS amount FROM bids b JOIN users u ON u.id=b.user_id WHERE b.lot_id=? GROUP BY u.id ORDER BY amount DESC', (lot_id,)).fetchall()
-    return [dict(row) for row in rows if row['id'] not in refused]
+    rows = db.execute(
+        "SELECT u.id,u.username,u.first_name,u.applicant_given_name,u.applicant_family_name,MAX(b.amount) AS amount FROM bids b JOIN users u ON u.id=b.user_id WHERE b.lot_id=? GROUP BY u.id ORDER BY amount DESC",
+        (lot_id,),
+    ).fetchall()
+    return [dict(row) for row in rows if row["id"] not in refused]

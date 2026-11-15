@@ -1,0 +1,11 @@
+{
+  "name": "friends-auction",
+  "private": true,
+  "scripts": {
+    "format": "prettier --write static",
+    "format:check": "prettier --check static"
+  },
+  "devDependencies": {
+    "prettier": "3.10.1"
+  }
+}

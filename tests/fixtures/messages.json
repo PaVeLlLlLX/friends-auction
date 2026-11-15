@@ -1,0 +1,18 @@
+{
+  "participant_name": "Друг",
+  "lot_title": "Бокалы",
+  "lot_description": "Описание",
+  "lot_condition": "Хорошее",
+  "given_name": "Анна",
+  "family_name": "Примерова",
+  "photo_lot_title": "Фото",
+  "reminder_fragment": "меньше часа",
+  "edited_lot_title": "Другая вещь",
+  "edited_lot_condition": "Новое",
+  "outbid_fragment": "перебили",
+  "padded_given_name": " Анна ",
+  "padded_family_name": " Иванова ",
+  "private_family_name": "Иванова",
+  "second_given_name": "Михаил",
+  "second_family_name": "Тестов"
+}

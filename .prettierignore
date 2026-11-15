@@ -1,0 +1,4 @@
+data/
+.venv/
+.tools/
+node_modules/

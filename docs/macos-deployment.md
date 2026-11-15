@@ -1,0 +1,87 @@
+# Deployment on macOS
+
+The native service uses Gunicorn, the notification worker, and an optional
+Cloudflare Tunnel. A per-user launch agent supervises the stack independently
+of Terminal. Docker is not required for this deployment method.
+
+## Prerequisites
+
+- Python 3.11 or newer, Git and `cloudflared`.
+- A Telegram bot token and the organizer's numeric Telegram ID.
+- A macOS user session with network access. The agent starts when that user logs in.
+
+For predictable source identity, deploy an annotated release tag into a separate
+directory. Do not edit or overwrite the directory of a running release.
+
+## Prepare a release
+
+Run these commands from a clone containing the release tag:
+
+```sh
+git fetch --tags
+AUCTION_DEPLOY_ROOT="$HOME/Library/Application Support/Friends Auction"
+AUCTION_RELEASE_DIR="$AUCTION_DEPLOY_ROOT/releases/v1.0.0"
+mkdir -p "$AUCTION_RELEASE_DIR" "$AUCTION_DEPLOY_ROOT/bin"
+chmod 700 "$AUCTION_DEPLOY_ROOT"
+git archive v1.0.0 | tar -x -C "$AUCTION_RELEASE_DIR"
+python3.12 -m venv "$AUCTION_RELEASE_DIR/.venv"
+"$AUCTION_RELEASE_DIR/.venv/bin/python" -m pip install -r "$AUCTION_RELEASE_DIR/requirements.txt"
+install -m 700 "$(command -v cloudflared)" "$AUCTION_DEPLOY_ROOT/bin/cloudflared"
+cp "$AUCTION_RELEASE_DIR/docs/service-config.example.json" "$AUCTION_DEPLOY_ROOT/config.json"
+chmod 600 "$AUCTION_DEPLOY_ROOT/config.json"
+```
+
+Replace `python3.12` if another supported version is installed. Fill in `token`
+and `admin_id` in the private `config.json`; never commit or share that file.
+The optional `data_dir` and `cloudflared` fields override the default sibling
+directories `data/` and `bin/cloudflared`. All configured paths must be absolute.
+
+The data directory contains `auction.sqlite3` and `photos/`. For an existing
+auction, stop its source web server and worker, preserve a backup, then migrate
+the complete database and its registered photographs before starting this
+service. SQLite's backup API provides a consistent database snapshot. Copying
+only the database or only the photographs is insufficient. Existing accounts,
+approval decisions, bids and subscriptions remain valid after migration.
+
+## Start and control the service
+
+```sh
+"$AUCTION_RELEASE_DIR/.venv/bin/python" "$AUCTION_RELEASE_DIR/scripts/macos_service.py" install --config "$AUCTION_DEPLOY_ROOT/config.json"
+"$AUCTION_RELEASE_DIR/.venv/bin/python" "$AUCTION_RELEASE_DIR/scripts/macos_service.py" status --config "$AUCTION_DEPLOY_ROOT/config.json"
+```
+
+The installer creates `~/Library/LaunchAgents/local.friends-auction.server.plist`
+with file paths but no credentials. Unsuccessful service exits restart after
+a 15-second throttle. The supervisor stops the entire stack before restarting
+it, so a stale worker cannot continue polling the same bot. Successful cleanup
+at the end of retention stops the service without a restart loop.
+
+Use the same command with `stop`, `start` or `restart` to control an installed
+agent. Stop the integration environment before enabling this service's bot
+polling. The service binds only to `127.0.0.1`, disables demo and trial modes,
+and records readiness in `$AUCTION_DEPLOY_ROOT/status.json`.
+
+`GET /api/version` reports the packaged semantic version. Private rotating logs
+are stored in `$AUCTION_DEPLOY_ROOT/logs/`; child output has tokens and HTTP URLs
+redacted. The launch agent also captures otherwise unhandled startup output.
+Backups and retired deployment directories remain the operator's responsibility
+under the data retention policy.
+
+## HTTPS access and availability
+
+With an empty `public_url`, the supervisor creates a Quick Tunnel and updates
+the Telegram menu and `/start` replies to its current HTTPS URL. Reconnection
+can change that URL; participants should open the application through the bot.
+Cloudflare documents Quick Tunnels as temporary development endpoints with no
+uptime guarantee: [Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
+
+For a stable origin, set `public_url` to a root HTTPS URL. Provide `tunnel_config`
+as an absolute path to a configured managed tunnel file, or manage the HTTPS
+reverse proxy separately. The supervisor checks public readiness before enabling
+bot polling.
+
+The default launch agent uses `caffeinate -s` to prevent system sleep while the
+Mac is on AC power. It does not change power settings or prevent lid-triggered
+sleep. Network loss, shutdown, logout and sleep interrupt availability. The
+service resumes after the next login. Pass `--allow-sleep` during installation
+to omit the power assertion.

@@ -36,6 +36,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from pillow_heif import register_heif_opener
 from werkzeug.exceptions import HTTPException
 
+from auction import __version__
 from auction.contracts import JSONObject, JSONValue
 from auction.i18n import translate
 from auction.models import (
@@ -144,6 +145,7 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         ADMIN_ID=os.environ.get("TELEGRAM_ADMIN_ID", ""),
         DEMO=os.environ.get("AUCTION_DEMO") == "1",
         TRIAL=os.environ.get("AUCTION_TRIAL") == "1",
+        CLOUDFLARE_PROXY=os.environ.get("AUCTION_CLOUDFLARE_PROXY") == "1",
         END=END,
         DELETE_AFTER=DELETE_AFTER,
         TESTING=False,
@@ -241,14 +243,14 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             return count <= limit
 
     def cloudflare_client_ip() -> str | None:
-        """Trust CF-Connecting-IP only in explicit trial mode through a loopback peer.
+        """Trust CF-Connecting-IP only for an explicitly enabled loopback tunnel.
 
         Return None for an invalid address or an untrusted connection so ordinary
         request addressing remains the fallback.
         """
-        # In trial mode the listener is bound to loopback behind our Cloudflare tunnel.
+        # Both supported tunnel modes bind the listener to loopback.
         # Never trust this header merely because a public client supplied it.
-        if not app.config["TRIAL"]:
+        if not (app.config["TRIAL"] or app.config["CLOUDFLARE_PROXY"]):
             return None
         try:
             if not ipaddress.ip_address(request.remote_addr or "").is_loopback:
@@ -513,6 +515,11 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             demo=app.config["DEMO"],
             trial=app.config["TRIAL"],
         )
+
+    @app.get("/api/version")
+    def version() -> Response:
+        """Return the packaged application version without deployment credentials."""
+        return jsonify(version=__version__)
 
     @app.get("/api/lots")
     def lots() -> Response:

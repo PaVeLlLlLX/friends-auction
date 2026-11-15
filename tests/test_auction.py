@@ -237,12 +237,14 @@ def test_one_signed_user_cannot_exhaust_another_users_write_limit(
     )
 
 
-def test_trial_application_flood_is_limited_per_cloudflare_client(
-    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("trial", [True, False])
+def test_tunnel_application_flood_is_limited_per_cloudflare_client(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch, trial: bool
 ) -> None:
-    """Limit trial applications by trusted client IP without blocking organizer reads."""
+    """Limit applications behind explicit tunnels without blocking organizer reads."""
     monkeypatch.setattr("auction.app.time.monotonic", lambda: 6000)
-    app.config["TRIAL"] = True
+    app.config["TRIAL"] = trial
+    app.config["CLOUDFLARE_PROXY"] = not trial
     payload = {
         "given_name": sample("given_name"),
         "family_name": sample("family_name"),
@@ -279,6 +281,26 @@ def test_trial_application_flood_is_limited_per_cloudflare_client(
 def test_oversized_lot_id_is_not_a_server_error(client: FlaskClient) -> None:
     """Return a missing-lot response for identifiers outside SQLite integer range."""
     assert client.get("/api/lots/" + "9" * 30).status_code == 404
+
+
+@pytest.mark.parametrize("proxy, peer", [(False, "127.0.0.1"), (True, "203.0.113.20")])
+def test_untrusted_forwarded_addresses_cannot_evade_guest_limits(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch, proxy: bool, peer: str
+) -> None:
+    """Ignore forged client addresses unless the explicit tunnel flag and loopback peer agree."""
+    app.config.update(TRIAL=False, CLOUDFLARE_PROXY=proxy)
+    monkeypatch.setattr("auction.app.time.monotonic", lambda: 6000)
+    statuses = [
+        client.post(
+            "/api/application",
+            json={},
+            headers={"CF-Connecting-IP": f"198.51.100.{index}"},
+            environ_base={"REMOTE_ADDR": peer},
+        ).status_code
+        for index in range(1, 62)
+    ]
+    assert statuses[:60] == [401] * 60
+    assert statuses[-1] == 429
 
 
 def test_zero_bid_step_approval_and_private_data(client: FlaskClient) -> None:

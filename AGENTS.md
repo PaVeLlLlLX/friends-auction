@@ -12,3 +12,4 @@
 - Run strict mypy checks for Python and TypeScript `checkJs` for JavaScript. Do not silence failures with blanket `Any`, `@ts-nocheck`, ignored modules or disabled strictness; use a documented boundary assertion only where the application owns or validates the shape.
 - Run Python checks with Ruff, mypy and pytest, and frontend checks with Prettier and `npm run typecheck`. Add regression tests for behavioral fixes; use browser checks for changes to interactive flows.
 - Keep operational setup reproducible from a clean clone. Runtime dependencies belong in `requirements.txt`; development tools belong in `requirements-dev.txt` or `package.json`.
+- Keep credentials and live storage out of container build contexts. Container changes require Compose validation and a passing container smoke job; use isolated volumes and fake credentials for verification.

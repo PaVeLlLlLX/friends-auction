@@ -37,3 +37,66 @@ jobs:
       - run: npm ci
       - run: npm run format:check
       - run: npm run typecheck
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPOSE_PROJECT_NAME: friends-auction-ci
+      TELEGRAM_BOT_TOKEN: "123456:container-smoke-token-unused"
+      TELEGRAM_ADMIN_ID: "1"
+      AUCTION_HTTP_PORT: "18080"
+      AUCTION_BOT_POLL: "0"
+      AUCTION_APP_URL: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build and start the web container
+        run: docker compose up --build --detach --wait --wait-timeout 90 web
+      - name: Check runtime isolation and write persistent data
+        run: |
+          curl --fail --silent http://127.0.0.1:18080/ > /dev/null
+          docker compose exec -T web python - <<'PY'
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          assert os.getuid() == 10001
+          assert os.statvfs('/app').f_flag & os.ST_RDONLY
+          assert not any(Path(path).exists() for path in (
+              '/app/.env', '/app/.git', '/app/tests', '/app/node_modules',
+              '/app/data/testing-config.json', '/app/data/testing.sqlite3',
+          ))
+          with sqlite3.connect(os.environ['AUCTION_DB']) as db:
+              db.execute("INSERT INTO jobs(name, completed) VALUES('container-smoke', 1)")
+          Path(os.environ['AUCTION_UPLOADS'], 'container-smoke.jpg').write_bytes(b'container-smoke')
+          PY
+      - name: Recreate the web container
+        run: docker compose up --detach --force-recreate --wait --wait-timeout 90 web
+      - name: Check worker access, volume persistence and retention cleanup
+        run: |
+          docker compose run --rm --no-deps -T worker python - <<'PY'
+          import os
+          from contextlib import closing
+          from pathlib import Path
+
+          from auction.app import connect, create_app
+          from auction.worker import tick
+
+          app = create_app()
+          photo = Path(os.environ['AUCTION_UPLOADS'], 'container-smoke.jpg')
+          with closing(connect(os.environ['AUCTION_DB'])) as db:
+              assert db.execute("SELECT completed FROM jobs WHERE name='container-smoke'").fetchone()[0] == 1
+          assert photo.read_bytes() == b'container-smoke'
+          assert tick(app, now=0) is None
+          assert tick(app, now=app.config['DELETE_AFTER'] + 1) is True
+          assert not photo.exists()
+          with closing(connect(os.environ['AUCTION_DB'])) as db:
+              assert db.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0
+          PY
+      - name: Show container logs and remove temporary volumes
+        if: always()
+        run: |
+          docker compose logs --no-color
+          docker compose down --volumes --remove-orphans

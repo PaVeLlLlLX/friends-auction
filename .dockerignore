@@ -1,0 +1,13 @@
+# Only runtime sources may enter the build context.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!run.py
+!auction/
+!auction/*.py
+!static/
+!static/app.js
+!static/index.html
+!static/ru.json
+!static/style.css

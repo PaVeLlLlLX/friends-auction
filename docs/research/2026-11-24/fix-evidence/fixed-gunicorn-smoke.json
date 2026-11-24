@@ -1,0 +1,12 @@
+{
+  "version_endpoint": {
+    "source_commit": null,
+    "version": "1.1.0"
+  },
+  "in_flight_status": 200,
+  "in_flight_completed": true,
+  "gunicorn": "27.0.1",
+  "click": "8.5.1",
+  "process_returncode": 0,
+  "mode": "isolated temporary app+SQLite/photos, loopback only, fake credentials, no Telegram/tunnel"
+}

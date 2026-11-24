@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.2.0] - 2026-11-24
+
+### Fixed
+
+- Serialize all account and API writes with retention cleanup, preventing late requests from recreating expired records.
+- Bind bids to the observed lot revision as well as price, including the first zero-price bid.
+- Deduplicate lot creation by operation identifier and content fingerprint after lost HTTP responses.
+- Reserve candidate notifications and expose sent/unknown delivery reconciliation before candidate changes.
+- Return authoritative personal-history states for archived and cancelled lots without broken public links.
+- Preserve keyboard focus during live detail/admin updates and improve secondary-text contrast.
+- Apply separate rate limits to public photographs, assets and page requests.
+- Wait for launchd teardown before restart, monitor runtime HTTP/worker health and allow graceful request completion.
+
+### Added
+
+- Verified private SQLite/JPEG snapshots and expiry cleanup for application-owned backups.
+- Public, validated source-commit metadata for prepared native and container releases.
+- Runtime dependency auditing in CI and a complete runtime version lock.
+
+### Dependencies
+
+- Upgrade Gunicorn to the published 27.0.1 release, including bounded HTTP/1 chunk parsing.
+- Pin all ten runtime package versions; artifact hashes remain outside the lock scope.
+
+### Deployment notes
+
+- Startup adds lot revisions and operation/delivery receipt tables without removing existing lots, approvals or bids.
+- Regenerate native launch-agent plists to use the 45-second exit timeout.
+- Older open clients must reload to submit the new revision/operation fields.
+- Managed backup deletion requires the same `AUCTION_BACKUPS` setting in web/worker; native service and Compose set it automatically.
+
 ## [1.1.0] - 2026-11-15
 
 ### Added

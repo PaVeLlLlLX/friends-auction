@@ -7,6 +7,7 @@ import re
 import socket
 import ssl
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,21 +59,29 @@ def read_diagnostics(process: subprocess.Popen[str], diagnostics: deque[str]) ->
         diagnostics.append(line.rstrip())
 
 
-def stop(processes: Sequence[subprocess.Popen[str]]) -> None:
-    """Stop child processes in reverse startup order, escalating after five seconds.
+def stop(processes: Sequence[subprocess.Popen[str]], *, grace_period: float = 30) -> None:
+    """Stop children in reverse startup order with one shared graceful deadline.
 
-    Already exited children are reaped without being signalled. A child that
-    ignores termination is killed, then given another bounded wait to exit.
+    All live children receive SIGTERM before waiting, allowing Gunicorn to finish
+    accepted requests for up to thirty seconds. Remaining children are killed and
+    reaped within a second shared five-second deadline. Exited children are not
+    signalled. Wait/kill failures propagate rather than silently leaking processes.
     """
     for process in reversed(processes):
         if process.poll() is None:
             process.terminate()
+    deadline = time.monotonic() + grace_period
+    remaining: list[subprocess.Popen[str]] = []
     for process in reversed(processes):
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+            remaining.append(process)
+    for process in remaining:
+        process.kill()
+    kill_deadline = time.monotonic() + 5
+    for process in remaining:
+        process.wait(timeout=max(0, kill_deadline - time.monotonic()))
 
 
 def verify_public_url(url: str, *, quick_only: bool = True) -> bool:

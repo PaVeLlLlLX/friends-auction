@@ -1,0 +1,254 @@
+{
+  "runtime_wheels": {
+    "linux-x64-py311": [
+      {
+        "package": "blinker",
+        "version": "1.9.0",
+        "filename": "blinker-1.9.0-py3-none-any.whl",
+        "sha256": "ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc"
+      },
+      {
+        "package": "click",
+        "version": "8.5.1",
+        "filename": "click-8.5.1-py3-none-any.whl",
+        "sha256": "8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37"
+      },
+      {
+        "package": "flask",
+        "version": "3.1.3",
+        "filename": "flask-3.1.3-py3-none-any.whl",
+        "sha256": "f4bcbefc124291925f1a26446da31a5178f9483862233b23c0c96a20701f670c"
+      },
+      {
+        "package": "gunicorn",
+        "version": "27.0.1",
+        "filename": "gunicorn-27.0.1-py3-none-any.whl",
+        "sha256": "378b26b9a38adcf4592f28828233c1716acc55e833ea06bf48719782efaa0d10"
+      },
+      {
+        "package": "itsdangerous",
+        "version": "2.2.0",
+        "filename": "itsdangerous-2.2.0-py3-none-any.whl",
+        "sha256": "c6242fc49e35958c8b15141343aa660db5fc54d4f13a1db01a3f5891b98700ef"
+      },
+      {
+        "package": "jinja2",
+        "version": "3.1.6",
+        "filename": "jinja2-3.1.6-py3-none-any.whl",
+        "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+      },
+      {
+        "package": "markupsafe",
+        "version": "3.0.4",
+        "filename": "markupsafe-3.0.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "6da83a088f8ef93b2d483a8232a4dbf4d69d3d8496b568a03c56becac43e1808"
+      },
+      {
+        "package": "pillow",
+        "version": "13.0.0",
+        "filename": "pillow-13.0.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "a625df9a2a5597fa5e5266e01aefc82604bb85d291e3547981e863560d75da6c"
+      },
+      {
+        "package": "pillow-heif",
+        "version": "1.8.1",
+        "filename": "pillow_heif-1.8.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "a94f02ccb61042820e9fc60b2a427d85377c6017d27b7594d33f26b1c78918e5"
+      },
+      {
+        "package": "werkzeug",
+        "version": "3.1.9",
+        "filename": "werkzeug-3.1.9-py3-none-any.whl",
+        "sha256": "6392e50c78460ba618e5b21f08a71f59c99ce99cdc6cf6e3dd7e6ccca8754fab"
+      }
+    ],
+    "linux-x64-py312": [
+      {
+        "package": "blinker",
+        "version": "1.9.0",
+        "filename": "blinker-1.9.0-py3-none-any.whl",
+        "sha256": "ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc"
+      },
+      {
+        "package": "click",
+        "version": "8.5.1",
+        "filename": "click-8.5.1-py3-none-any.whl",
+        "sha256": "8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37"
+      },
+      {
+        "package": "flask",
+        "version": "3.1.3",
+        "filename": "flask-3.1.3-py3-none-any.whl",
+        "sha256": "f4bcbefc124291925f1a26446da31a5178f9483862233b23c0c96a20701f670c"
+      },
+      {
+        "package": "gunicorn",
+        "version": "27.0.1",
+        "filename": "gunicorn-27.0.1-py3-none-any.whl",
+        "sha256": "378b26b9a38adcf4592f28828233c1716acc55e833ea06bf48719782efaa0d10"
+      },
+      {
+        "package": "itsdangerous",
+        "version": "2.2.0",
+        "filename": "itsdangerous-2.2.0-py3-none-any.whl",
+        "sha256": "c6242fc49e35958c8b15141343aa660db5fc54d4f13a1db01a3f5891b98700ef"
+      },
+      {
+        "package": "jinja2",
+        "version": "3.1.6",
+        "filename": "jinja2-3.1.6-py3-none-any.whl",
+        "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+      },
+      {
+        "package": "markupsafe",
+        "version": "3.0.4",
+        "filename": "markupsafe-3.0.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "8e124f974786f831d6043728e38296969d3579db8896fe004682f5758e613581"
+      },
+      {
+        "package": "pillow",
+        "version": "13.0.0",
+        "filename": "pillow-13.0.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "42d63be3af4f9b951b199b0a9d23365d37ab14687e6d77b74940432c8515c4ca"
+      },
+      {
+        "package": "pillow-heif",
+        "version": "1.8.1",
+        "filename": "pillow_heif-1.8.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "3811fa95ad29d6abd37a72c88c8c682dd1ff41d51fddf4899255328bfccbe358"
+      },
+      {
+        "package": "werkzeug",
+        "version": "3.1.9",
+        "filename": "werkzeug-3.1.9-py3-none-any.whl",
+        "sha256": "6392e50c78460ba618e5b21f08a71f59c99ce99cdc6cf6e3dd7e6ccca8754fab"
+      }
+    ],
+    "mac-arm64-py311": [
+      {
+        "package": "blinker",
+        "version": "1.9.0",
+        "filename": "blinker-1.9.0-py3-none-any.whl",
+        "sha256": "ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc"
+      },
+      {
+        "package": "click",
+        "version": "8.5.1",
+        "filename": "click-8.5.1-py3-none-any.whl",
+        "sha256": "8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37"
+      },
+      {
+        "package": "flask",
+        "version": "3.1.3",
+        "filename": "flask-3.1.3-py3-none-any.whl",
+        "sha256": "f4bcbefc124291925f1a26446da31a5178f9483862233b23c0c96a20701f670c"
+      },
+      {
+        "package": "gunicorn",
+        "version": "27.0.1",
+        "filename": "gunicorn-27.0.1-py3-none-any.whl",
+        "sha256": "378b26b9a38adcf4592f28828233c1716acc55e833ea06bf48719782efaa0d10"
+      },
+      {
+        "package": "itsdangerous",
+        "version": "2.2.0",
+        "filename": "itsdangerous-2.2.0-py3-none-any.whl",
+        "sha256": "c6242fc49e35958c8b15141343aa660db5fc54d4f13a1db01a3f5891b98700ef"
+      },
+      {
+        "package": "jinja2",
+        "version": "3.1.6",
+        "filename": "jinja2-3.1.6-py3-none-any.whl",
+        "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+      },
+      {
+        "package": "markupsafe",
+        "version": "3.0.4",
+        "filename": "markupsafe-3.0.4-cp311-cp311-macosx_11_0_arm64.whl",
+        "sha256": "7d3391b2188d18737cb2fa147028b1096236eaa7e156446c650a489fa2cadc91"
+      },
+      {
+        "package": "pillow",
+        "version": "13.0.0",
+        "filename": "pillow-13.0.0-cp311-cp311-macosx_11_0_arm64.whl",
+        "sha256": "37290fbef0c73e2d51d594eb78fded7dc7170d1c3ad0a890269e6fd8c8c4e061"
+      },
+      {
+        "package": "pillow-heif",
+        "version": "1.8.1",
+        "filename": "pillow_heif-1.8.1-cp311-cp311-macosx_11_0_arm64.whl",
+        "sha256": "961a0298ede61a7eb559c095662c90a9e567984cfc006527b8b902034388c609"
+      },
+      {
+        "package": "werkzeug",
+        "version": "3.1.9",
+        "filename": "werkzeug-3.1.9-py3-none-any.whl",
+        "sha256": "6392e50c78460ba618e5b21f08a71f59c99ce99cdc6cf6e3dd7e6ccca8754fab"
+      }
+    ],
+    "mac-arm64-py312": [
+      {
+        "package": "blinker",
+        "version": "1.9.0",
+        "filename": "blinker-1.9.0-py3-none-any.whl",
+        "sha256": "ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc"
+      },
+      {
+        "package": "click",
+        "version": "8.5.1",
+        "filename": "click-8.5.1-py3-none-any.whl",
+        "sha256": "8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37"
+      },
+      {
+        "package": "flask",
+        "version": "3.1.3",
+        "filename": "flask-3.1.3-py3-none-any.whl",
+        "sha256": "f4bcbefc124291925f1a26446da31a5178f9483862233b23c0c96a20701f670c"
+      },
+      {
+        "package": "gunicorn",
+        "version": "27.0.1",
+        "filename": "gunicorn-27.0.1-py3-none-any.whl",
+        "sha256": "378b26b9a38adcf4592f28828233c1716acc55e833ea06bf48719782efaa0d10"
+      },
+      {
+        "package": "itsdangerous",
+        "version": "2.2.0",
+        "filename": "itsdangerous-2.2.0-py3-none-any.whl",
+        "sha256": "c6242fc49e35958c8b15141343aa660db5fc54d4f13a1db01a3f5891b98700ef"
+      },
+      {
+        "package": "jinja2",
+        "version": "3.1.6",
+        "filename": "jinja2-3.1.6-py3-none-any.whl",
+        "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+      },
+      {
+        "package": "markupsafe",
+        "version": "3.0.4",
+        "filename": "markupsafe-3.0.4-cp312-cp312-macosx_11_0_arm64.whl",
+        "sha256": "0930db9bdc62d22944e10b066448bb65dc9abe9112880c7cab8da54db4284d5f"
+      },
+      {
+        "package": "pillow",
+        "version": "13.0.0",
+        "filename": "pillow-13.0.0-cp312-cp312-macosx_11_0_arm64.whl",
+        "sha256": "fc481f742ccda20e9ed760b8f978dff50f2a4e9bc253ac167fb0a05b0783ef52"
+      },
+      {
+        "package": "pillow-heif",
+        "version": "1.8.1",
+        "filename": "pillow_heif-1.8.1-cp312-cp312-macosx_11_0_arm64.whl",
+        "sha256": "1c60f323daf9df728858e469e0d95010727a32ee3e6c8e9658809a070fb93f69"
+      },
+      {
+        "package": "werkzeug",
+        "version": "3.1.9",
+        "filename": "werkzeug-3.1.9-py3-none-any.whl",
+        "sha256": "6392e50c78460ba618e5b21f08a71f59c99ce99cdc6cf6e3dd7e6ccca8754fab"
+      }
+    ]
+  },
+  "upload_artifact_v4_6_2_sha": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+  "scope": "wheel download/resolution check only; foreign Python/OS runtimes were not executed"
+}

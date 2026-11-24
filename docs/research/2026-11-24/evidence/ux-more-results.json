@@ -1,0 +1,23 @@
+{
+  "stableArchivedHistory": "Audit lot\n24.11.2026, 14:56:39 · Ставку перебили\n0 ₽",
+  "draftPolling": {
+    "competitorStatus": 200,
+    "amount": "250",
+    "focused": true,
+    "min": "50"
+  },
+  "styles": {
+    "hintColor": "rgb(133, 146, 137)",
+    "fontSize": "11px",
+    "background": "rgb(245, 245, 243)",
+    "bodyWidth": 390,
+    "viewport": 390
+  },
+  "focusAfterPoll": {
+    "oldButtonConnected": false,
+    "activeTag": "BODY",
+    "activeId": "",
+    "competitorStatus": 200
+  },
+  "errors": []
+}

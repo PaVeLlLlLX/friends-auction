@@ -39,6 +39,25 @@ def send_message(token: str, user_id: int, message: str) -> bool:
         return False
 
 
+def record_heartbeat(app: Flask) -> None:
+    """Persist worker progress under the cleanup lock, never after retention expiry."""
+    db = connect(cast(str, app.config["DB"]))
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        if now < cast(float, app.config["DELETE_AFTER"]):
+            db.execute(
+                "INSERT INTO jobs(name,completed) VALUES('worker_heartbeat',?) ON CONFLICT(name) DO UPDATE SET completed=excluded.completed",
+                (now,),
+            )
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def poll_start_messages(app: Flask, app_url: str, send: TelegramCaller = call) -> None:
     """Reply to private ``/start`` requests and persist the Telegram update cursor.
 
@@ -46,7 +65,7 @@ def poll_start_messages(app: Flask, app_url: str, send: TelegramCaller = call) -
     offline adapter. A retryable reply failure leaves that update unacknowledged;
     non-retryable failures advance the cursor. Non-HTTPS app URLs are ignored.
     """
-    if not app_url.startswith("https://"):
+    if not app_url.startswith("https://") or time.time() >= cast(float, app.config["DELETE_AFTER"]):
         return
     db = connect(cast(str, app.config["DB"]))
     token = cast(str, app.config["BOT_TOKEN"])
@@ -63,6 +82,8 @@ def poll_start_messages(app: Flask, app_url: str, send: TelegramCaller = call) -
             logging.warning("Could not poll Telegram updates")
             return
         for update in updates if isinstance(updates, list) else []:
+            if time.time() >= cast(float, app.config["DELETE_AFTER"]):
+                return
             if not isinstance(update, dict):
                 continue
             update_id = update.get("update_id")
@@ -109,10 +130,16 @@ def poll_start_messages(app: Flask, app_url: str, send: TelegramCaller = call) -
                     logging.warning("Could not reply to a Telegram start request")
                     if error.retryable:
                         break
+            db.execute("BEGIN IMMEDIATE")
+            if time.time() >= cast(float, app.config["DELETE_AFTER"]):
+                db.rollback()
+                return
             db.execute(
                 "INSERT INTO jobs(name,completed) VALUES('telegram_offset',?) ON CONFLICT(name) DO UPDATE SET completed=excluded.completed",
                 (update_id + 1,),
             )
+            db.commit()
+            record_heartbeat(app)
     finally:
         db.close()
 
@@ -133,13 +160,32 @@ def tick(app: Flask, now: float | None = None, send: MessageSender = send_messag
             # There are no user-created directories in UPLOADS. Repeat cleanup on restart.
             db.execute("PRAGMA secure_delete=ON")
             db.execute("BEGIN IMMEDIATE")
-            for table in ("events", "subscriptions", "bids", "photos", "lots", "users", "jobs"):
+            for table in (
+                "candidate_notifications",
+                "lot_operations",
+                "events",
+                "subscriptions",
+                "bids",
+                "photos",
+                "lots",
+                "users",
+                "jobs",
+            ):
                 db.execute("DELETE FROM " + table)
             db.commit()
             for file in Path(cast(str, app.config["UPLOADS"])).glob("*.jpg"):
                 file.unlink(missing_ok=True)
             db.execute("VACUUM")
+            if app.config.get("BACKUPS"):
+                from auction.storage import purge_managed_backups
+
+                purge_managed_backups(
+                    Path(cast(str, app.config["BACKUPS"])),
+                    now,
+                    cast(float, app.config["DELETE_AFTER"]),
+                )
             return True
+        record_heartbeat(app)
         local = datetime.fromtimestamp(now, TZ)
         end = cast(float, app.config["END"])
         token = cast(str, app.config["BOT_TOKEN"])
@@ -189,8 +235,15 @@ def tick(app: Flask, now: float | None = None, send: MessageSender = send_messag
                     + body
                     + translate("notification_digest_suffix")
                 )
-                if send(token, user[0], msg):
+                if time.time() >= cast(float, app.config["DELETE_AFTER"]):
+                    return None
+                sent = send(token, user[0], msg)
+                record_heartbeat(app)
+                if sent:
                     db.execute("BEGIN IMMEDIATE")
+                    if time.time() >= cast(float, app.config["DELETE_AFTER"]):
+                        db.rollback()
+                        return None
                     db.executemany(
                         "UPDATE events SET sent=1 WHERE id=?", [(r["id"],) for r in rows]
                     )
@@ -205,8 +258,17 @@ def tick(app: Flask, now: float | None = None, send: MessageSender = send_messag
                 job = f"reminder:{user[0]}"
                 if db.execute("SELECT 1 FROM jobs WHERE name=?", (job,)).fetchone():
                     continue
-                if send(token, user[0], translate("notification_closing_reminder")):
+                if time.time() >= cast(float, app.config["DELETE_AFTER"]):
+                    return None
+                sent = send(token, user[0], translate("notification_closing_reminder"))
+                record_heartbeat(app)
+                if sent:
+                    db.execute("BEGIN IMMEDIATE")
+                    if time.time() >= cast(float, app.config["DELETE_AFTER"]):
+                        db.rollback()
+                        return None
                     db.execute("INSERT OR IGNORE INTO jobs(name,completed) VALUES(?,?)", (job, now))
+                    db.commit()
             users = db.execute(
                 "SELECT DISTINCT user_id FROM events WHERE sent=0 AND kind='outbid' AND created>=?",
                 (end - 3600,),
@@ -227,7 +289,11 @@ def tick(app: Flask, now: float | None = None, send: MessageSender = send_messag
                     + body
                     + translate("notification_closing_suffix")
                 )
-                if send(token, user[0], msg):
+                if time.time() >= cast(float, app.config["DELETE_AFTER"]):
+                    return None
+                sent = send(token, user[0], msg)
+                record_heartbeat(app)
+                if sent:
                     db.executemany(
                         "UPDATE events SET sent=1 WHERE id=?", [(r["id"],) for r in rows]
                     )

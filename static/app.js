@@ -55,6 +55,18 @@ function outcomeUnknown(error) {
   return error instanceof Error && 'outcomeUnknown' in error && error.outcomeUnknown === true;
 }
 
+/** Create a UUID with cryptographic randomness, including browsers without randomUUID.
+ * @returns {string} A canonical operation ID; unavailable secure randomness is an error.
+ */
+function createOperationId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 /**
  * Initialize SDK/localization, bind the views and start visibility-aware polling.
  * @returns {Promise<void>}
@@ -103,7 +115,7 @@ function outcomeUnknown(error) {
   /** @type {Record<string, string>} */
   let messages;
   try {
-    const response = await fetch('/assets/ru.json?v=3', {
+    const response = await fetch('/assets/ru.json?v=4', {
       cache: 'no-cache',
       signal: translationController.signal,
     });
@@ -188,6 +200,10 @@ function outcomeUnknown(error) {
    * @type {WeakMap<HTMLElement, string>}
    */
   const historySignatures = new WeakMap();
+  /** An unresolved publication survives navigation within this app without another create intent.
+   * @type {CreateAttempt | null}
+   */
+  let createAttempt = null;
   /** Show a transient status message, replacing any previous toast.
    * @param {string} message @returns {void}
    */
@@ -196,6 +212,51 @@ function outcomeUnknown(error) {
     toastEl.classList.add('visible');
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => toastEl.classList.remove('visible'), 4000);
+  }
+  /** Record a focused control's stable identity before replacing a view.
+   * @param {HTMLElement} parent @returns {FocusSnapshot | null}
+   */
+  function captureFocus(parent) {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement) || !parent.contains(active)) return null;
+    return {
+      id: active.id,
+      photo: active.dataset.photo ?? null,
+      user: active.dataset.user ?? null,
+      status: active.dataset.status ?? null,
+    };
+  }
+  /** Restore a matching enabled control, or a heading when that action no longer exists.
+   * @param {HTMLElement} parent @param {FocusSnapshot | null} snapshot @returns {void}
+   */
+  function restoreFocus(parent, snapshot) {
+    if (!snapshot) return;
+    let target = snapshot.id ? document.getElementById(snapshot.id) : null;
+    if (!target && snapshot.photo)
+      target =
+        elements('button[data-photo]', HTMLButtonElement, parent).find(
+          (button) => button.dataset.photo === snapshot.photo,
+        ) ?? null;
+    if (!target && snapshot.user)
+      target =
+        elements('button[data-user]', HTMLButtonElement, parent).find(
+          (button) =>
+            button.dataset.user === snapshot.user && button.dataset.status === snapshot.status,
+        ) ?? null;
+    if (
+      !target ||
+      !parent.contains(target) ||
+      target.hidden ||
+      ((target instanceof HTMLButtonElement ||
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement) &&
+        target.disabled)
+    ) {
+      target = findElement('h1, h2, h3', HTMLElement, parent);
+      if (target) target.tabIndex = -1;
+    }
+    target?.focus({ preventScroll: true });
   }
   /**
    * Send an authenticated JSON/FormData request with a bounded lifetime.
@@ -262,7 +323,14 @@ function outcomeUnknown(error) {
           typeof data.error === 'string'
             ? data.error
             : translate('error_request_failed');
-        throw new Error(message);
+        /** A server-side failure can follow a committed write; retain its reconciliation state.
+         * @type {RequestFailure}
+         */
+        const failure = new Error(
+          isWrite && response.status >= 500 ? translate('error_request_timeout_write') : message,
+        );
+        failure.outcomeUnknown = Boolean(isWrite && response.status >= 500);
+        throw failure;
       }
       return data;
     } finally {
@@ -553,7 +621,11 @@ function outcomeUnknown(error) {
         if (!confirm(`${translate('bid_confirm_prefix')}${money(amount)}?`)) return;
         bid.disabled = true;
         try {
-          await post(`/api/lots/${lot.id}/bid`, { amount, expected_price: current.price });
+          await post(`/api/lots/${lot.id}/bid`, {
+            amount,
+            expected_price: current.price,
+            expected_revision: current.revision,
+          });
           toast(translate('bid_accepted'));
           await load();
         } catch (e) {
@@ -637,18 +709,21 @@ function outcomeUnknown(error) {
     }
     box.innerHTML = data.bids
       .map((b) => {
-        const lot = state.lots.find((x) => x.id === b.lot_id);
-        const status =
-          lot && lot.status === 'cancelled'
+        const status = b.deleted
+          ? translate('lot_deleted_badge')
+          : b.status === 'cancelled'
             ? translate('lot_status_cancelled')
-            : lot && lot.status === 'ended'
-              ? lot.leading
+            : b.status === 'ended'
+              ? b.own_leading
                 ? translate('lot_status_won')
                 : translate('lot_ended_title')
-              : lot && lot.leading
+              : b.own_leading
                 ? translate('lot_status_leading')
                 : translate('lot_status_outbid');
-        return `<a class="list-item" href="#/lot/${b.lot_id}"><span><strong>${esc(b.title)}</strong><small>${new Date(b.created * 1000).toLocaleString('ru-RU', { timeZone: 'Asia/Novosibirsk' })} · ${status}</small></span><strong>${money(b.amount)}</strong></a>`;
+        const content = `<span><strong>${esc(b.title)}</strong><small>${new Date(b.created * 1000).toLocaleString('ru-RU', { timeZone: 'Asia/Novosibirsk' })} · ${status}</small></span><strong>${money(b.amount)}</strong>`;
+        return b.deleted
+          ? `<div class="list-item">${content}</div>`
+          : `<a class="list-item" href="#/lot/${b.lot_id}">${content}</a>`;
       })
       .join('');
   }
@@ -745,6 +820,7 @@ function outcomeUnknown(error) {
   function drawApplications(data) {
     const box = findElement('#admin-content', HTMLElement);
     if (!box) return;
+    const focus = captureFocus(box);
     state.applications = data.users;
     box.innerHTML = data.users.length
       ? data.users
@@ -801,6 +877,75 @@ function outcomeUnknown(error) {
           }
         }),
     );
+    restoreFocus(box, focus);
+  }
+  /** Restore a pending publication's frozen fields and keep its result visible until resolved.
+   * @param {HTMLFormElement} form @returns {void}
+   */
+  function updateCreateAttemptForm(form) {
+    const attempt = createAttempt;
+    const locked = Boolean(attempt && (attempt.pending || attempt.unknown));
+    for (const field of elements('input, textarea', HTMLElement, form)) {
+      if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement)) continue;
+      if (attempt && field.name && !(field instanceof HTMLInputElement && field.type === 'file')) {
+        const value = attempt.payload.get(field.name);
+        if (typeof value === 'string') field.value = value;
+      }
+      field.disabled = locked;
+    }
+    const result = requireElement('#new-lot-result', HTMLElement, form);
+    result.hidden = !locked;
+    result.textContent = locked
+      ? translate(attempt?.pending ? 'lot_publication_pending' : 'lot_publication_unknown')
+      : '';
+    const button = requireElement('button[type=submit]', HTMLButtonElement, form);
+    button.textContent = translate(attempt?.unknown ? 'lot_publication_check' : 'lot_publish');
+    button.disabled = Boolean(attempt?.pending);
+  }
+  /** Bind one publication intent; retries keep the frozen payload and operation ID.
+   * Changed editable forms become a new intent, while an unresolved write locks its fields.
+   * @param {HTMLFormElement} form @returns {void}
+   */
+  function bindCreateForm(form) {
+    /** A deliberate edit after a definitive failure starts another creation intent.
+     * @returns {void}
+     */
+    const invalidate = () => {
+      if (createAttempt && !createAttempt.pending && !createAttempt.unknown) createAttempt = null;
+    };
+    form.addEventListener('input', invalidate);
+    form.addEventListener('change', invalidate);
+    updateCreateAttemptForm(form);
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const button = requireElement('button[type=submit]', HTMLButtonElement, form);
+      await runAdminAction(button, async () => {
+        if (!createAttempt) {
+          const operationId = createOperationId();
+          const payload = new FormData(form);
+          payload.set('operation_id', operationId);
+          createAttempt = { operationId, payload, unknown: false, pending: false };
+        }
+        const attempt = createAttempt;
+        attempt.pending = true;
+        updateCreateAttemptForm(form);
+        try {
+          const result = await post('/api/admin/lots', attempt.payload);
+          createAttempt = null;
+          state.lots = [...state.lots.filter((lot) => lot.id !== result.lot.id), result.lot];
+          toast(translate('lot_published'));
+          if (location.hash === '#/admin' && state.me?.admin && state.adminView === 'new')
+            await admin('lots');
+        } catch (error) {
+          if (outcomeUnknown(error)) attempt.unknown = true;
+          throw error;
+        } finally {
+          attempt.pending = false;
+          const current = findElement('#new-lot', HTMLFormElement);
+          if (current) updateCreateAttemptForm(current);
+        }
+      });
+    };
   }
   /** Open an organizer tab while retaining unsaved create/edit forms during background polling.
    * @param {AdminTab} [tab='lots'] @returns {Promise<void>}
@@ -816,21 +961,8 @@ function outcomeUnknown(error) {
     adminShell(tab);
     const box = requireElement('#admin-content', HTMLElement);
     if (tab === 'new') {
-      box.innerHTML = `<div class="panel"><h3>${translate('lot_create_title')}</h3><p>${translate('lot_common_deadline_hint')}</p><form id="new-lot"><label class="field"><span>${translate('lot_title_label_with_space')}<span class="required">*</span></span><input name="title" maxlength="120" required placeholder="${translate('lot_title_placeholder')}"></label><label class="field"><span>${translate('lot_description_label')}</span><textarea name="description" maxlength="3000" placeholder="${translate('lot_description_placeholder')}"></textarea></label><label class="field"><span>${translate('lot_condition_label')}</span><input name="condition" maxlength="120" placeholder="${translate('lot_condition_placeholder')}"></label><div class="input-row"><label class="field"><span>${translate('lot_start_price_label')}</span><input name="start_price" type="number" min="0" max="100000000" value="0" required></label><label class="field"><span>${translate('lot_step_label')}</span><input name="step" type="number" min="1" max="100000000" value="50" required></label></div><label class="field"><span>${translate('lot_photos_label')}</span><input name="photos" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" multiple></label><p class="hint">${translate('lot_photos_privacy_hint')}</p><button class="button full" type="submit">${translate('lot_publish')}</button></form></div>`;
-      requireElement('#new-lot', HTMLFormElement).onsubmit = async (e) => {
-        e.preventDefault();
-        const form = requireElement('#new-lot', HTMLFormElement);
-        await runAdminAction(
-          requireElement('button', HTMLButtonElement, form),
-          async (isCurrent) => {
-            await post('/api/admin/lots', new FormData(form));
-            toast(translate('lot_published'));
-            const d = await api('/api/lots');
-            state.lots = d.lots;
-            if (isCurrent()) admin('lots');
-          },
-        );
-      };
+      box.innerHTML = `<div class="panel"><h3>${translate('lot_create_title')}</h3><p>${translate('lot_common_deadline_hint')}</p><form id="new-lot"><label class="field"><span>${translate('lot_title_label_with_space')}<span class="required">*</span></span><input name="title" maxlength="120" required placeholder="${translate('lot_title_placeholder')}"></label><label class="field"><span>${translate('lot_description_label')}</span><textarea name="description" maxlength="3000" placeholder="${translate('lot_description_placeholder')}"></textarea></label><label class="field"><span>${translate('lot_condition_label')}</span><input name="condition" maxlength="120" placeholder="${translate('lot_condition_placeholder')}"></label><div class="input-row"><label class="field"><span>${translate('lot_start_price_label')}</span><input name="start_price" type="number" min="0" max="100000000" value="0" required></label><label class="field"><span>${translate('lot_step_label')}</span><input name="step" type="number" min="1" max="100000000" value="50" required></label></div><label class="field"><span>${translate('lot_photos_label')}</span><input name="photos" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" multiple></label><p class="hint">${translate('lot_photos_privacy_hint')}</p><p id="new-lot-result" class="live-change" role="status" hidden></p><button class="button full" type="submit">${translate('lot_publish')}</button></form></div>`;
+      bindCreateForm(requireElement('#new-lot', HTMLFormElement));
       return;
     }
     if (tab === 'applications') {
@@ -937,9 +1069,22 @@ function outcomeUnknown(error) {
         return;
       state.adminLotSignature = JSON.stringify(data);
       const l = data.lot;
+      const delivery = data.candidate_notification;
+      const deliveryBlocksActions = delivery?.state === 'sending' || delivery?.state === 'unknown';
+      const currentDeliverySent =
+        delivery?.state === 'sent' && delivery.candidate_id === data.candidates[0]?.id;
+      const recipient = delivery
+        ? data.bids.find((person) => person.id === delivery.candidate_id)
+        : null;
+      const deliveryNotice = delivery
+        ? `<section class="panel candidate-notification"><h3>${translate('candidate_notification_title')}</h3><p>${translate('candidate_notification_recipient')}${recipient ? privateName(recipient) : esc(delivery.candidate_id)}</p><p role="status">${translate(`candidate_notification_${delivery.state}`)}</p>${delivery.state === 'unknown' ? `<div class="actions"><button type="button" class="button secondary" data-notification-outcome="sent">${translate('candidate_notification_checked_sent')}</button><button type="button" class="button secondary" data-notification-outcome="not_sent">${translate('candidate_notification_checked_not_sent')}</button></div>` : ''}</section>`
+        : '';
       const box = findElement('#admin-content', HTMLElement);
       if (!box) return;
-      box.innerHTML = `<button class="back back-button" id="admin-back">${translate(l.deleted ? 'nav_archive' : 'nav_catalog')}</button><div class="panel"><h3>${esc(l.title)}</h3><p>${l.deleted ? translate('lot_archive_hint') : l.status === 'active' ? translate('lot_bidding_active') : l.status === 'ended' ? translate('lot_ended_title') : translate('lot_status_cancelled')} · ${l.count}${translate('bid_count_suffix')}</p><div class="actions">${l.status === 'active' && l.count === 0 ? `<button class="button secondary" id="edit-lot">${translate('lot_edit')}</button>` : ''}${!l.deleted ? `<button class="button danger" id="delete-lot">${translate('lot_delete')}</button>` : ''}${l.status === 'active' ? `<button class="button danger" id="cancel-lot">${translate('lot_cancel')}</button>` : ''}${l.status === 'ended' && data.candidates.length ? `<button class="button danger" id="refuse">${translate('candidate_refuse')}</button>${data.has_refusals ? `<button class="button secondary" id="notify-candidate">${translate('candidate_notify')}</button>` : ''}<button class="button secondary" data-fulfill="agreed">${translate('fulfillment_agreed_action')}</button><button class="button secondary" data-fulfill="delivered">${translate('fulfillment_delivered_action')}</button>` : ''}</div><p>${translate('fulfillment_label')}${data.fulfillment === 'agreed' ? translate('fulfillment_agreed') : data.fulfillment === 'delivered' ? translate('fulfillment_delivered') : translate('fulfillment_unset')}</p></div><h3>${translate('candidates_title')}</h3>${data.candidates.length ? data.candidates.map((u, i) => `<div class="list-item"><span><strong>${i === 0 ? '★ ' : ''}${privateName(u)} ${u.username ? '@' + esc(u.username) : ''}</strong><small>Telegram ID: ${u.id}</small></span><strong>${money(u.amount)}</strong></div>`).join('') : `<p class="hint">${translate('candidates_empty')}</p>`}<h3>${translate('history_title')}</h3>${data.bids.map((b) => `<div class="list-item"><span>${privateName(b)} ${b.username ? '@' + esc(b.username) : ''}</span><strong>${money(b.amount)}</strong></div>`).join('')}`;
+      const focus = captureFocus(box);
+      const scrollX = window.scrollX,
+        scrollY = window.scrollY;
+      box.innerHTML = `<button class="back back-button" id="admin-back">${translate(l.deleted ? 'nav_archive' : 'nav_catalog')}</button><div class="panel"><h3>${esc(l.title)}</h3><p>${l.deleted ? translate('lot_archive_hint') : l.status === 'active' ? translate('lot_bidding_active') : l.status === 'ended' ? translate('lot_ended_title') : translate('lot_status_cancelled')} · ${l.count}${translate('bid_count_suffix')}</p><div class="actions">${l.status === 'active' && l.count === 0 ? `<button class="button secondary" id="edit-lot">${translate('lot_edit')}</button>` : ''}${!l.deleted ? `<button class="button danger" id="delete-lot" ${deliveryBlocksActions ? 'disabled' : ''}>${translate('lot_delete')}</button>` : ''}${l.status === 'active' ? `<button class="button danger" id="cancel-lot" ${deliveryBlocksActions ? 'disabled' : ''}>${translate('lot_cancel')}</button>` : ''}${l.status === 'ended' && data.candidates.length ? `<button class="button danger" id="refuse" ${deliveryBlocksActions ? 'disabled' : ''}>${translate('candidate_refuse')}</button>${data.has_refusals ? `<button class="button secondary" id="notify-candidate" ${deliveryBlocksActions || currentDeliverySent ? 'disabled' : ''}>${translate('candidate_notify')}</button>` : ''}<button class="button secondary" data-fulfill="agreed">${translate('fulfillment_agreed_action')}</button><button class="button secondary" data-fulfill="delivered">${translate('fulfillment_delivered_action')}</button>` : ''}</div><p>${translate('fulfillment_label')}${data.fulfillment === 'agreed' ? translate('fulfillment_agreed') : data.fulfillment === 'delivered' ? translate('fulfillment_delivered') : translate('fulfillment_unset')}</p></div>${deliveryNotice}<h3>${translate('candidates_title')}</h3>${data.candidates.length ? data.candidates.map((u, i) => `<div class="list-item"><span><strong>${i === 0 ? '★ ' : ''}${privateName(u)} ${u.username ? '@' + esc(u.username) : ''}</strong><small>Telegram ID: ${u.id}</small></span><strong>${money(u.amount)}</strong></div>`).join('') : `<p class="hint">${translate('candidates_empty')}</p>`}<h3>${translate('history_title')}</h3>${data.bids.map((b) => `<div class="list-item"><span>${privateName(b)} ${b.username ? '@' + esc(b.username) : ''}</span><strong>${money(b.amount)}</strong></div>`).join('')}`;
       requireElement('#admin-back', HTMLButtonElement).onclick = () =>
         admin(l.deleted ? 'archive' : 'lots');
       const edit = findElement('#edit-lot', HTMLButtonElement);
@@ -1001,13 +1146,33 @@ function outcomeUnknown(error) {
       if (notify)
         notify.onclick = () => {
           if (confirm(translate('candidate_notify_confirm')))
-            runAdminAction(notify, async () => {
-              await post(`/api/admin/lots/${id}/notify-candidate`, {
-                expected_candidate_id: data.candidates[0].id,
-              });
-              toast(translate('candidate_notification_sent'));
+            runAdminAction(notify, async (isCurrent) => {
+              try {
+                await post(`/api/admin/lots/${id}/notify-candidate`, {
+                  expected_candidate_id: data.candidates[0].id,
+                });
+                toast(translate('candidate_notification_sent'));
+              } finally {
+                if (isCurrent()) await adminLot(id);
+                else requestImmediateSync();
+              }
             });
         };
+      elements('[data-notification-outcome]', HTMLButtonElement, box).forEach(
+        (button) =>
+          (button.onclick = () => {
+            const outcome = button.dataset.notificationOutcome;
+            if (!delivery || (outcome !== 'sent' && outcome !== 'not_sent')) return;
+            if (!confirm(translate(`candidate_notification_confirm_${outcome}`))) return;
+            runAdminAction(button, async (isCurrent) => {
+              await post(`/api/admin/lots/${id}/candidate-notification/resolve`, {
+                expected_candidate_id: delivery.candidate_id,
+                outcome,
+              });
+              if (isCurrent()) await adminLot(id);
+            });
+          }),
+      );
       elements('[data-fulfill]', HTMLButtonElement, box).forEach(
         (b) =>
           (b.onclick = () =>
@@ -1019,6 +1184,8 @@ function outcomeUnknown(error) {
               if (isCurrent()) await adminLot(id);
             })),
       );
+      restoreFocus(box, focus);
+      window.scrollTo(scrollX, scrollY);
       if (editRequested) edit?.click();
     } catch (e) {
       toast(errorMessage(e));
@@ -1235,11 +1402,16 @@ function outcomeUnknown(error) {
         if (signature !== detailRenderedSignature) {
           if (lot && detailHasDraft()) patchDetail(lot);
           else if (lot) {
+            const focus = captureFocus(root);
+            const scrollX = window.scrollX,
+              scrollY = window.scrollY;
             const photo = findElement('#main-photo', HTMLImageElement);
             const selected = photo && photo.getAttribute('src');
             detail(lot);
             const restored = findElement('#main-photo', HTMLImageElement);
             if (restored && selected && lot.photos.includes(selected)) restored.src = selected;
+            restoreFocus(root, focus);
+            window.scrollTo(scrollX, scrollY);
           } else
             root.innerHTML = `<div class="page"><div class="empty"><strong>${translate('lot_not_found_title')}</strong></div></div>`;
           if (oldMe && oldMe.status === 'pending' && state.me && state.me.status === 'approved')

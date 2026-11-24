@@ -1,0 +1,28 @@
+{
+  "environment": "Flask test client, temporary SQLite/photos, fake bot token and identities, no network or live data",
+  "api_305_requests": {
+    "200": 300,
+    "429": 5
+  },
+  "photo_305_requests_after_api_throttle": {
+    "200": 305
+  },
+  "admin_access": {
+    "guest": 401,
+    "signed-unapproved": 403,
+    "organizer": 200
+  },
+  "tampered_admin_signature": 401,
+  "ordinary_profile_keys": ["admin", "first_name", "status", "username"],
+  "replay_semantics": {
+    "same_token_twice": [200, 200],
+    "at_23_hours": true,
+    "at_25_hours": false
+  },
+  "photo_security_headers": {
+    "Cache-Control": "no-cache",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer"
+  }
+}

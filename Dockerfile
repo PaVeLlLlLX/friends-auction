@@ -17,6 +17,10 @@ COPY auction/ ./auction/
 COPY static/ ./static/
 COPY run.py ./
 
+ARG SOURCE_COMMIT=""
+LABEL org.opencontainers.image.revision="${SOURCE_COMMIT}"
+RUN python -c "import json, os; from pathlib import Path; from auction import __version__; Path('auction/build-info.json').write_text(json.dumps({'version': __version__, 'source_commit': os.environ.get('SOURCE_COMMIT', '')}), encoding='utf-8')"
+
 USER 10001:10001
 EXPOSE 8080
 

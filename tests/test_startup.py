@@ -126,3 +126,39 @@ def test_expired_integration_cleans_without_starting_public_services(
     environment = calls[0][1]["env"]
     assert isinstance(environment, dict)
     assert environment["AUCTION_DB"] == str(tmp_path / "data/testing.sqlite3")
+
+
+def test_gunicorn_bounds_unterminated_chunk_size_lines() -> None:
+    """Keep malformed framing bounded before any application handler reads its body."""
+    script = '''
+import json
+from types import SimpleNamespace
+from gunicorn.http.body import ChunkedReader
+from gunicorn.http.errors import InvalidChunkSize
+
+class FiniteUnreader:
+    """Supply at most 100 KiB of malformed synthetic framing without opening a socket."""
+
+    def __init__(self) -> None:
+        """Track consumed chunks to distinguish an early bound from exhausting the input."""
+        self.reads = 0
+
+    def read(self) -> bytes:
+        """Return finite chunk-extension data without a terminating CRLF."""
+        self.reads += 1
+        return b"1;" + b"a" * 1022 if self.reads <= 100 else b""
+
+unreader = FiniteUnreader()
+request = SimpleNamespace(limit_request_field_size=8190, max_buffer_headers=65536)
+reader = ChunkedReader(request, unreader)
+try:
+    reader.parse_chunk_size(unreader)
+except InvalidChunkSize:
+    print(json.dumps({"bounded": unreader.reads < 100}))
+else:
+    raise AssertionError("Malformed framing was accepted")
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True, timeout=5
+    )
+    assert json.loads(result.stdout) == {"bounded": True}

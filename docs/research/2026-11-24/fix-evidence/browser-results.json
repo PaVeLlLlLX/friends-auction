@@ -1,0 +1,55 @@
+{
+  "zeroConfirm": "Подтвердить ставку 0 ₽?",
+  "enterAndZero": {
+    "postCount": 1,
+    "payload": {
+      "amount": 0,
+      "expected_price": null,
+      "expected_revision": 1
+    }
+  },
+  "photoAndCheckboxFocus": {
+    "selected": "/photos/65a37a88a7ab4ef98c918fec60101431",
+    "fit": "contain",
+    "focusedThumbnail": true
+  },
+  "draft": {
+    "amount": 250,
+    "min": 50,
+    "focused": true
+  },
+  "buttonFocus": true,
+  "styles": {
+    "color": "rgb(82, 97, 88)",
+    "fontSize": "11px",
+    "background": "rgb(245, 245, 243)",
+    "width": 390,
+    "viewport": 390
+  },
+  "archivedHistory": "archive\n24.11.2026, 15:25:59 · Удалён\n0 ₽",
+  "revisionConflict": {
+    "attemptedRevision": 1,
+    "acceptedBids": 0
+  },
+  "idempotentCreate": {
+    "operationIds": [
+      "0732de80-4b2c-4fee-bd2c-28e3c09db5ce",
+      "0732de80-4b2c-4fee-bd2c-28e3c09db5ce"
+    ],
+    "created": 1,
+    "retainedAfterNavigation": true,
+    "persistentFeedback": true
+  },
+  "changedIntent": {
+    "newOperation": true
+  },
+  "candidateNotifications": {
+    "fakeCalls": 3,
+    "unknownBlocks": true,
+    "cancelConfirmationNoChange": true,
+    "notSentAllowsExplicitRetry": true,
+    "sentRepeatNoDelivery": true,
+    "manualSentNoDelivery": true
+  },
+  "errors": []
+}

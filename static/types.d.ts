@@ -19,6 +19,7 @@ interface User {
 /** Public lot plus subscription and leading-bid flags scoped to the requesting user. */
 interface Lot {
   id: number;
+  revision: number;
   title: string;
   description: string;
   condition: string;
@@ -61,6 +62,15 @@ interface MyBid {
   title: string;
   amount: number;
   created: number;
+  deleted: boolean;
+  status: 'active' | 'cancelled' | 'ended';
+  own_leading: boolean;
+}
+
+/** Delivery receipt for the organizer's currently relevant candidate notification. */
+interface CandidateNotification {
+  candidate_id: number;
+  state: 'sending' | 'sent' | 'unknown' | 'not_sent';
 }
 
 interface MeResponse {
@@ -85,6 +95,7 @@ interface AdminLotResponse {
   bids: AdminBid[];
   has_refusals: boolean;
   fulfillment: Fulfillment;
+  candidate_notification: CandidateNotification | null;
 }
 /** Archived lots remain visible only through organizer-authorized endpoints. */
 interface AdminLot extends Lot {
@@ -114,7 +125,11 @@ interface ApiGetResponses {
 interface ApiPostBodies {
   '/api/application': { given_name: string; family_name: string };
   '/api/admin/lots': FormData;
-  [path: `/api/lots/${number}/bid`]: { amount: number; expected_price: number | null };
+  [path: `/api/lots/${number}/bid`]: {
+    amount: number;
+    expected_price: number | null;
+    expected_revision: number;
+  };
   [path: `/api/lots/${number}/subscription`]: {
     kind: 'watching' | 'participation';
     enabled: boolean;
@@ -130,6 +145,10 @@ interface ApiPostBodies {
     step: number;
   };
   [path: `/api/admin/lots/${number}/notify-candidate`]: { expected_candidate_id: number };
+  [path: `/api/admin/lots/${number}/candidate-notification/resolve`]: {
+    expected_candidate_id: number;
+    outcome: 'sent' | 'not_sent';
+  };
   [path: `/api/admin/lots/${number}/delete`]: { expected_bid_count: number };
 }
 interface ApiPostResponses {
@@ -141,6 +160,7 @@ interface ApiPostResponses {
   [path: `/api/admin/lots/${number}`]: OkResponse;
   [path: `/api/admin/lots/${number}/edit`]: OkResponse;
   [path: `/api/admin/lots/${number}/notify-candidate`]: OkResponse;
+  [path: `/api/admin/lots/${number}/candidate-notification/resolve`]: OkResponse;
   [path: `/api/admin/lots/${number}/delete`]: OkResponse;
 }
 
@@ -155,6 +175,22 @@ type ApiRequestOptions = Omit<RequestInit, 'body' | 'headers'> & {
 /** Transport errors mark writes whose server outcome cannot safely be inferred. */
 interface RequestFailure extends Error {
   outcomeUnknown?: boolean;
+}
+
+/** A single create intent retains its exact payload and ID until its result is known. */
+interface CreateAttempt {
+  operationId: string;
+  payload: FormData;
+  unknown: boolean;
+  pending: boolean;
+}
+
+/** Stable control identity used when a background refresh must replace view nodes. */
+interface FocusSnapshot {
+  id: string;
+  photo: string | null;
+  user: string | null;
+  status: string | null;
 }
 
 /** Authoritative snapshots and local view/cache bookkeeping; drafts remain in the DOM. */

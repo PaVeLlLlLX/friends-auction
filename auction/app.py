@@ -14,12 +14,13 @@ import time
 import urllib.parse
 import warnings
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import closing
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Literal, ParamSpec, TypeVar, cast, overload
+from uuid import UUID
 
 from flask import (
     Flask,
@@ -36,12 +37,12 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from pillow_heif import register_heif_opener
 from werkzeug.exceptions import HTTPException
 
-from auction import __version__
 from auction.contracts import JSONObject, JSONValue
 from auction.i18n import translate
 from auction.models import (
     AdminLot,
     Candidate,
+    CandidateNotification,
     LotRecord,
     PublicLot,
     TelegramIdentity,
@@ -52,6 +53,7 @@ from auction.models import (
     personal_bid_from_row,
     user_from_row,
 )
+from auction.release import release_metadata
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -66,13 +68,15 @@ register_heif_opener()
 SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, first_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','pending','approved','rejected')), applicant_given_name TEXT NOT NULL DEFAULT '', applicant_family_name TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS lots (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, condition TEXT NOT NULL, start_price INTEGER NOT NULL, step INTEGER NOT NULL, created REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','cancelled')), fulfillment TEXT NOT NULL DEFAULT '', refused TEXT NOT NULL DEFAULT '[]', deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)));
+CREATE TABLE IF NOT EXISTS lots (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, condition TEXT NOT NULL, start_price INTEGER NOT NULL, step INTEGER NOT NULL, created REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','cancelled')), fulfillment TEXT NOT NULL DEFAULT '', refused TEXT NOT NULL DEFAULT '[]', deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>=1));
 CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY, lot_id INTEGER NOT NULL REFERENCES lots(id) ON DELETE CASCADE, filename TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS bids (id INTEGER PRIMARY KEY, lot_id INTEGER NOT NULL REFERENCES lots(id), user_id INTEGER NOT NULL REFERENCES users(id), amount INTEGER NOT NULL, created REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS bids_lot ON bids(lot_id, amount DESC, id DESC);
 CREATE TABLE IF NOT EXISTS subscriptions (lot_id INTEGER NOT NULL REFERENCES lots(id), user_id INTEGER NOT NULL REFERENCES users(id), participation INTEGER NOT NULL DEFAULT 0, watching INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(lot_id,user_id));
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, lot_id INTEGER NOT NULL REFERENCES lots(id), user_id INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL, created REAL NOT NULL, sent INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS jobs (name TEXT PRIMARY KEY, completed REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS lot_operations (operation_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, lot_id INTEGER NOT NULL REFERENCES lots(id), created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS candidate_notifications (lot_id INTEGER NOT NULL REFERENCES lots(id), candidate_id INTEGER NOT NULL REFERENCES users(id), attempt_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','sent','unknown','not_sent')), updated REAL NOT NULL, PRIMARY KEY(lot_id,candidate_id));
 """
 
 
@@ -147,6 +151,7 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         DEMO=os.environ.get("AUCTION_DEMO") == "1",
         TRIAL=os.environ.get("AUCTION_TRIAL") == "1",
         CLOUDFLARE_PROXY=os.environ.get("AUCTION_CLOUDFLARE_PROXY") == "1",
+        BACKUPS=os.environ.get("AUCTION_BACKUPS", ""),
         END=END,
         DELETE_AFTER=DELETE_AFTER,
         TESTING=False,
@@ -182,6 +187,10 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
                 db.execute(
                     "ALTER TABLE lots ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1))"
                 )
+            if "revision" not in lot_columns:
+                db.execute(
+                    "ALTER TABLE lots ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>=1)"
+                )
             db.commit()
         except Exception:
             db.rollback()
@@ -192,6 +201,25 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         if "db" not in g:
             g.db = connect(app.config["DB"])
         return cast(sqlite3.Connection, g.db)
+
+    @contextmanager
+    def write_transaction() -> Iterator[sqlite3.Connection]:
+        """Serialize a mutation with final cleanup and reject expired writes under lock.
+
+        Account refreshes use the same discipline as explicit API mutations, so
+        a request admitted before expiry cannot recreate data after cleanup.
+        The caller must not hold another transaction or perform network I/O here.
+        """
+        db = database()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            if time.time() >= app.config["DELETE_AFTER"]:
+                abort(410, translate("error_retention_expired"))
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
 
     @app.teardown_appcontext
     def close_db(error: BaseException | None) -> None:
@@ -210,6 +238,8 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         resp.headers["Cache-Control"] = (
             "no-store" if request.path.startswith("/api/") else "no-cache"
         )
+        if resp.status_code == 429:
+            resp.headers["Retry-After"] = "60"
         return resp
 
     @app.errorhandler(400)
@@ -282,6 +312,20 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             request.path.startswith("/api/") or request.path.startswith("/photos/")
         ):
             abort(410, translate("error_retention_expired"))
+        public_scope = (
+            ("public-photo", 600)
+            if request.path.startswith("/photos/")
+            else (
+                ("public-asset", 600)
+                if request.path.startswith("/assets/")
+                else (("public-page", 120) if request.path == "/" else None)
+            )
+        )
+        if public_scope:
+            scope, public_limit = public_scope
+            client_ip = cloudflare_client_ip() or request.remote_addr or "unknown"
+            if not allow_rate(scope, client_ip, public_limit):
+                abort(429, translate("error_rate_limit"))
         if request.path.startswith("/api/"):
             user = identity()
             g.verified_identity = user
@@ -344,20 +388,20 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             if required:
                 abort(401, translate("error_telegram_login_required"))
             return None
-        db = database()
-        row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-        if row is None:
-            db.execute(
-                "INSERT INTO users(id, username, first_name) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING",
-                (user["id"], user["username"], user["first_name"]),
-            )
+        with write_transaction() as db:
             row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-        elif row["username"] != user["username"] or row["first_name"] != user["first_name"]:
-            db.execute(
-                "UPDATE users SET username=?, first_name=? WHERE id=?",
-                (user["username"], user["first_name"], user["id"]),
-            )
-            row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+            if row is None:
+                db.execute(
+                    "INSERT INTO users(id, username, first_name) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING",
+                    (user["id"], user["username"], user["first_name"]),
+                )
+                row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+            elif row["username"] != user["username"] or row["first_name"] != user["first_name"]:
+                db.execute(
+                    "UPDATE users SET username=?, first_name=? WHERE id=?",
+                    (user["username"], user["first_name"], user["id"]),
+                )
+                row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         return user_from_row(row)
 
     def admin_required(fn: Callable[P, R]) -> Callable[P, R]:
@@ -474,6 +518,7 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             has_bid=has_bid,
             participation=bool(sub and sub["participation"]),
             watching=bool(sub and sub["watching"]),
+            revision=lot["revision"],
         )
 
     @app.get("/")
@@ -526,7 +571,7 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
     @app.get("/api/version")
     def version() -> Response:
         """Return the packaged application version without deployment credentials."""
-        return jsonify(version=__version__)
+        return jsonify(release_metadata())
 
     @app.get("/api/lots")
     def lots() -> Response:
@@ -556,6 +601,7 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         submissions preserve an existing application or organizer decision.
         """
         user = current_user(True)
+        names: tuple[str, str] | None = None
         if user["status"] == "new":
             data = json_body()
             given = data.get("given_name")
@@ -570,15 +616,17 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
                 for name in (given, family)
             ):
                 abort(400, translate("error_names_invalid"))
-            database().execute(
-                "UPDATE users SET status='pending', applicant_given_name=?, applicant_family_name=? WHERE id=? AND status='new'",
-                (given, family, user["id"]),
-            )
-        return jsonify(
-            status=database()
-            .execute("SELECT status FROM users WHERE id=?", (user["id"],))
-            .fetchone()["status"]
-        )
+            names = (given, family)
+        with write_transaction() as db:
+            if names is not None:
+                db.execute(
+                    "UPDATE users SET status='pending', applicant_given_name=?, applicant_family_name=? WHERE id=? AND status='new'",
+                    (*names, user["id"]),
+                )
+            status = db.execute("SELECT status FROM users WHERE id=?", (user["id"],)).fetchone()[
+                "status"
+            ]
+        return jsonify(status=status)
 
     @app.post("/api/lots/<int:lot_id>/bid")
     def bid(lot_id: int) -> Response:
@@ -594,6 +642,9 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         payload = json_body()
         amount = payload.get("amount")
         expected = payload.get("expected_price")
+        expected_revision = payload.get("expected_revision")
+        if type(expected_revision) is not int or expected_revision < 1:
+            abort(409, translate("error_client_update_required"))
         if (
             type(amount) is not int
             or amount < 0
@@ -601,13 +652,13 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             or (expected is not None and type(expected) is not int)
         ):
             abort(400, translate("error_bid_amount_invalid"))
-        db = database()
-        db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction() as db:
             current = db.execute("SELECT status FROM users WHERE id=?", (user["id"],)).fetchone()
             if not current or current["status"] != "approved":
                 abort(403, translate("error_approval_required"))
             lot = active_lot(lot_id)
+            if expected_revision != lot["revision"]:
+                abort(409, translate("error_lot_revision_changed"))
             if lot["status"] != "active" or time.time() >= app.config["END"]:
                 abort(409, translate("error_bidding_closed"))
             lead = db.execute(
@@ -649,10 +700,6 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
                         "INSERT INTO events(lot_id,user_id,kind,created) VALUES(?,?,'watch',?)",
                         (lot_id, watcher["user_id"], now),
                     )
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
         return jsonify(lot=lot_view(active_lot(lot_id, include_deleted=True), user))
 
     @app.post("/api/lots/<int:lot_id>/subscription")
@@ -673,26 +720,26 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             or type(enabled) is not bool
         ):
             abort(400, translate("error_subscription_invalid"))
-        db = database()
-        if (
-            kind == "participation"
-            and enabled
-            and not db.execute(
-                "SELECT 1 FROM bids WHERE lot_id=? AND user_id=?", (lot_id, user["id"])
-            ).fetchone()
-        ):
-            abort(400, translate("error_participation_requires_bid"))
-        db.execute(
-            "INSERT OR IGNORE INTO subscriptions(lot_id,user_id) VALUES(?,?)", (lot_id, user["id"])
-        )
-        result = db.execute(
-            "UPDATE subscriptions SET "
-            + kind
-            + "=? WHERE lot_id=? AND user_id=? AND EXISTS(SELECT 1 FROM lots WHERE id=? AND deleted=0)",
-            (int(enabled), lot_id, user["id"], lot_id),
-        )
-        if result.rowcount == 0:
-            abort(404, translate("error_lot_not_found"))
+        with write_transaction() as db:
+            active_lot(lot_id)
+            if (
+                kind == "participation"
+                and enabled
+                and not db.execute(
+                    "SELECT 1 FROM bids WHERE lot_id=? AND user_id=?", (lot_id, user["id"])
+                ).fetchone()
+            ):
+                abort(400, translate("error_participation_requires_bid"))
+            db.execute(
+                "INSERT OR IGNORE INTO subscriptions(lot_id,user_id) VALUES(?,?)",
+                (lot_id, user["id"]),
+            )
+            result = db.execute(
+                "UPDATE subscriptions SET " + kind + "=? WHERE lot_id=? AND user_id=?",
+                (int(enabled), lot_id, user["id"]),
+            )
+            if result.rowcount == 0:
+                abort(404, translate("error_lot_not_found"))
         return jsonify(ok=True)
 
     @app.get("/api/my-bids")
@@ -701,10 +748,28 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         user = current_user(True)
         db = database()
         rows = db.execute(
-            "SELECT b.id,b.amount,b.created,b.lot_id,l.title FROM bids b JOIN lots l ON l.id=b.lot_id WHERE b.user_id=? ORDER BY b.id DESC",
+            "SELECT b.id,b.amount,b.created,b.lot_id,l.title,l.deleted,l.status,l.refused FROM bids b JOIN lots l ON l.id=b.lot_id WHERE b.user_id=? ORDER BY b.id DESC",
             (user["id"],),
         ).fetchall()
-        return jsonify(bids=[personal_bid_from_row(row) for row in rows])
+        projected = []
+        for row in rows:
+            status: Literal["active", "ended", "cancelled"] = (
+                "cancelled"
+                if row["deleted"] or row["status"] == "cancelled"
+                else ("ended" if time.time() >= app.config["END"] else "active")
+            )
+            candidates = candidates_for(
+                db, row["lot_id"], cast(list[int], json.loads(row["refused"]))
+            )
+            entry = personal_bid_from_row(
+                row,
+                status=status,
+                own_leading=bool(
+                    status != "cancelled" and candidates and candidates[0]["id"] == user["id"]
+                ),
+            )
+            projected.append(entry)
+        return jsonify(bids=projected)
 
     @app.get("/api/admin/applications")
     @admin_required
@@ -731,9 +796,10 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         status = json_body().get("status")
         if status not in ("approved", "rejected"):
             abort(400, translate("error_application_decision_invalid"))
-        result = database().execute("UPDATE users SET status=? WHERE id=?", (status, user_id))
-        if result.rowcount == 0:
-            abort(404, translate("error_application_not_found"))
+        with write_transaction() as db:
+            result = db.execute("UPDATE users SET status=? WHERE id=?", (status, user_id))
+            if result.rowcount == 0:
+                abort(404, translate("error_application_not_found"))
         return jsonify(ok=True)
 
     @app.post("/api/admin/lots")
@@ -745,8 +811,12 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         inside the write transaction. On failure roll back rows and remove attempted
         photo files, including partial writes; storage failures propagate.
         """
-        if time.time() >= app.config["END"]:
-            abort(409, translate("error_auction_closed"))
+        raw_operation = request.form.get("operation_id", "")
+        try:
+            if str(UUID(raw_operation)) != raw_operation:
+                raise ValueError("Non-canonical operation identifier")
+        except ValueError:
+            abort(400, translate("error_operation_id_required"))
         title = request.form.get("title", "").strip()
         description = request.form.get("description", "").strip()
         condition = request.form.get("condition", "").strip()
@@ -769,12 +839,42 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         images = request.files.getlist("photos")
         if len(images) > 6:
             abort(400, translate("error_photo_limit"))
+        sources = [uploaded.stream.read() for uploaded in images if uploaded.filename]
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "title": title,
+                    "description": description,
+                    "condition": condition,
+                    "start_price": start,
+                    "step": step,
+                    "photos": [hashlib.sha256(source).hexdigest() for source in sources],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+        def existing_operation(db: sqlite3.Connection) -> int | None:
+            """Return an earlier result only when this UUID describes identical content."""
+            receipt = db.execute(
+                "SELECT fingerprint,lot_id FROM lot_operations WHERE operation_id=?",
+                (raw_operation,),
+            ).fetchone()
+            if receipt is None:
+                return None
+            if receipt["fingerprint"] != fingerprint:
+                abort(409, translate("error_operation_payload_changed"))
+            return cast(int, receipt["lot_id"])
+
+        with write_transaction() as db:
+            existing = existing_operation(db)
+        if existing is not None:
+            return jsonify(lot=lot_view(active_lot(existing, include_deleted=True))), 201
         prepared: list[bytes] = []
-        for uploaded in images:
-            if not uploaded.filename:
-                continue
+        for source in sources:
             try:
-                img: Image.Image = Image.open(uploaded.stream)
+                img: Image.Image = Image.open(io.BytesIO(source))
                 if img.format not in ("JPEG", "PNG", "WEBP", "HEIF"):
                     abort(400, translate("error_photo_format"))
                 img = ImageOps.exif_transpose(img)
@@ -794,35 +894,67 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
                 Image.DecompressionBombWarning,
             ):
                 abort(400, translate("error_photo_unreadable"))
-        db = database()
         paths: list[Path] = []
         try:
-            db.execute("BEGIN IMMEDIATE")
-            now = time.time()
-            if now >= app.config["END"]:
-                abort(409, translate("error_auction_closed"))
-            lot_id = db.execute(
-                "INSERT INTO lots(title,description,condition,start_price,step,created) VALUES(?,?,?,?,?,?)",
-                (title, description, condition, start, step, now),
-            ).lastrowid
-            assert lot_id is not None
-            for content in prepared:
-                photo_id = secrets.token_hex(16)
-                filename = photo_id + ".jpg"
-                path = Path(app.config["UPLOADS"]) / filename
-                paths.append(path)
-                path.write_bytes(content)
-                db.execute(
-                    "INSERT INTO photos(id,lot_id,filename) VALUES(?,?,?)",
-                    (photo_id, lot_id, filename),
-                )
-            db.commit()
+            with write_transaction() as db:
+                existing = existing_operation(db)
+                if existing is not None:
+                    lot_id = existing
+                else:
+                    now = time.time()
+                    if now >= app.config["END"]:
+                        abort(409, translate("error_auction_closed"))
+                    inserted = db.execute(
+                        "INSERT INTO lots(title,description,condition,start_price,step,created) VALUES(?,?,?,?,?,?)",
+                        (title, description, condition, start, step, now),
+                    ).lastrowid
+                    assert inserted is not None
+                    lot_id = inserted
+                    for content in prepared:
+                        photo_id = secrets.token_hex(16)
+                        filename = photo_id + ".jpg"
+                        path = Path(app.config["UPLOADS"]) / filename
+                        paths.append(path)
+                        path.write_bytes(content)
+                        db.execute(
+                            "INSERT INTO photos(id,lot_id,filename) VALUES(?,?,?)",
+                            (photo_id, lot_id, filename),
+                        )
+                    db.execute(
+                        "INSERT INTO lot_operations(operation_id,fingerprint,lot_id,created) VALUES(?,?,?,?)",
+                        (raw_operation, fingerprint, lot_id, now),
+                    )
         except Exception:
-            db.rollback()
             for path in paths:
                 path.unlink(missing_ok=True)
             raise
-        return jsonify(lot=lot_view(active_lot(lot_id))), 201
+        return jsonify(lot=lot_view(active_lot(lot_id, include_deleted=True))), 201
+
+    def latest_notification(db: sqlite3.Connection, lot_id: int) -> CandidateNotification | None:
+        """Recover expired delivery leases conservatively without retrying a message.
+
+        The caller holds the write transaction. A lease exceeds the Telegram HTTP
+        timeout; process failure or suspension leaves an explicit unknown result.
+        """
+        now = time.time()
+        db.execute(
+            "UPDATE candidate_notifications SET state='unknown',updated=? WHERE lot_id=? AND state='sending' AND updated<?",
+            (now, lot_id, now - 120),
+        )
+        row = db.execute(
+            "SELECT candidate_id,state FROM candidate_notifications WHERE lot_id=? ORDER BY updated DESC,rowid DESC LIMIT 1",
+            (lot_id,),
+        ).fetchone()
+        return cast(CandidateNotification, dict(row)) if row else None
+
+    def require_notification_idle(db: sqlite3.Connection, lot_id: int) -> None:
+        """Block candidate changes while an offer is in flight or remains unresolved."""
+        latest_notification(db, lot_id)
+        if db.execute(
+            "SELECT 1 FROM candidate_notifications WHERE lot_id=? AND state IN ('sending','unknown')",
+            (lot_id,),
+        ).fetchone():
+            abort(409, translate("error_candidate_notification_pending"))
 
     @app.post("/api/admin/lots/<int:lot_id>")
     @admin_required
@@ -835,15 +967,15 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         """
         data = json_body()
         action = data.get("action")
-        db = database()
-        db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction() as db:
             lot = active_lot(lot_id)
             if action == "cancel":
+                require_notification_idle(db, lot_id)
                 db.execute("UPDATE lots SET status='cancelled' WHERE id=?", (lot_id,))
             elif action in ("agreed", "delivered", ""):
                 db.execute("UPDATE lots SET fulfillment=? WHERE id=?", (action, lot_id))
             elif action == "refuse":
+                require_notification_idle(db, lot_id)
                 if time.time() < app.config["END"] or lot["status"] != "active":
                     abort(409, translate("error_results_not_ready"))
                 refused = cast(list[int], json.loads(lot["refused"]))
@@ -858,10 +990,6 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
                 )
             else:
                 abort(400, translate("error_lot_action_invalid"))
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
         return jsonify(ok=True)
 
     @app.get("/api/admin/lots")
@@ -887,10 +1015,9 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
         expected = json_body().get("expected_bid_count")
         if type(expected) is not int or expected < 0:
             abort(400, translate("error_delete_confirmation_required"))
-        db = database()
-        db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction() as db:
             active_lot(lot_id)
+            require_notification_idle(db, lot_id)
             count = db.execute("SELECT count(*) FROM bids WHERE lot_id=?", (lot_id,)).fetchone()[0]
             if count != expected:
                 abort(409, translate("error_delete_bids_changed"))
@@ -898,10 +1025,6 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             db.execute(
                 "UPDATE subscriptions SET participation=0,watching=0 WHERE lot_id=?", (lot_id,)
             )
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
         return jsonify(ok=True)
 
     @app.post("/api/admin/lots/<int:lot_id>/edit")
@@ -935,9 +1058,7 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             or not 1 <= step <= 100_000_000
         ):
             abort(400, translate("error_lot_fields_invalid"))
-        db = database()
-        db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction() as db:
             lot = active_lot(lot_id)
             if (
                 lot["status"] != "active"
@@ -946,13 +1067,9 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
             ):
                 abort(409, translate("error_lot_edit_locked"))
             db.execute(
-                "UPDATE lots SET title=?,description=?,condition=?,start_price=?,step=? WHERE id=?",
+                "UPDATE lots SET title=?,description=?,condition=?,start_price=?,step=?,revision=revision+1 WHERE id=?",
                 (title, description, condition, start, step, lot_id),
             )
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
         return jsonify(ok=True)
 
     @app.get("/api/admin/lots/<int:lot_id>")
@@ -960,12 +1077,14 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
     def admin_lot_detail(lot_id: int) -> Response:
         """Return private candidate profiles and full bid history to the organizer only."""
         lot = active_lot(lot_id, include_deleted=True)
-        db = database()
+        with write_transaction() as db:
+            notification = latest_notification(db, lot_id)
         return jsonify(
             lot=AdminLot(**lot_view(lot), deleted=bool(lot["deleted"])),
             candidates=candidates_for(db, lot_id, cast(list[int], json.loads(lot["refused"]))),
             has_refusals=bool(json.loads(lot["refused"])),
             fulfillment=lot["fulfillment"],
+            candidate_notification=notification,
             bids=[
                 bid_history_from_row(r)
                 for r in db.execute(
@@ -978,29 +1097,79 @@ def create_app(config: Mapping[str, object] | None = None) -> Flask:
     @app.post("/api/admin/lots/<int:lot_id>/notify-candidate")
     @admin_required
     def notify_candidate(lot_id: int) -> Response:
-        """Send an organizer-requested offer to the explicitly selected fallback.
+        """Reserve one offer, send outside the DB lock, and persist sent/unknown.
 
-        Only closed active lots with a recorded refusal qualify. Check the current
-        candidate before an external Telegram send; delivery failure aborts 409.
-        The send is not transactional with a simultaneous later refusal.
+        Candidate-changing actions cannot race the reservation. A confirmed sent
+        receipt is idempotent; ambiguous delivery requires explicit reconciliation.
         """
-        lot = active_lot(lot_id)
-        if time.time() < app.config["END"] or lot["status"] != "active":
-            abort(409, translate("error_results_not_ready"))
-        candidates = candidates_for(database(), lot_id, cast(list[int], json.loads(lot["refused"])))
-        if not candidates or not json.loads(lot["refused"]):
-            abort(409, translate("error_fallback_not_selected"))
-        require_candidate(json_body(), candidates[0]["id"])
+        data = json_body()
+        with write_transaction() as db:
+            lot = active_lot(lot_id)
+            if time.time() < app.config["END"] or lot["status"] != "active":
+                abort(409, translate("error_results_not_ready"))
+            candidates = candidates_for(db, lot_id, cast(list[int], json.loads(lot["refused"])))
+            if not candidates or not json.loads(lot["refused"]):
+                abort(409, translate("error_fallback_not_selected"))
+            candidate_id = candidates[0]["id"]
+            require_candidate(data, candidate_id)
+            latest_notification(db, lot_id)
+            previous = db.execute(
+                "SELECT state FROM candidate_notifications WHERE lot_id=? AND candidate_id=?",
+                (lot_id, candidate_id),
+            ).fetchone()
+            if previous and previous["state"] == "sent":
+                return jsonify(ok=True, state="sent")
+            require_notification_idle(db, lot_id)
+            attempt_id = secrets.token_hex(16)
+            db.execute(
+                "INSERT INTO candidate_notifications(lot_id,candidate_id,attempt_id,state,updated) VALUES(?,?,?,'sending',?) ON CONFLICT(lot_id,candidate_id) DO UPDATE SET attempt_id=excluded.attempt_id,state='sending',updated=excluded.updated",
+                (lot_id, candidate_id, attempt_id, time.time()),
+            )
         from auction.worker import send_message
 
-        if not send_message(
-            app.config["BOT_TOKEN"],
-            candidates[0]["id"],
-            translate("notification_candidate_offer_prefix")
-            + lot["title"]
-            + translate("notification_candidate_offer_suffix"),
-        ):
-            abort(409, translate("error_notification_delivery"))
+        try:
+            delivered = send_message(
+                app.config["BOT_TOKEN"],
+                candidate_id,
+                translate("notification_candidate_offer_prefix")
+                + lot["title"]
+                + translate("notification_candidate_offer_suffix"),
+            )
+        except Exception:
+            delivered = False
+        with write_transaction() as db:
+            db.execute(
+                "UPDATE candidate_notifications SET state=?,updated=? WHERE lot_id=? AND candidate_id=? AND attempt_id=?",
+                ("sent" if delivered else "unknown", time.time(), lot_id, candidate_id, attempt_id),
+            )
+        if not delivered:
+            abort(409, translate("error_candidate_notification_unknown"))
+        return jsonify(ok=True, state="sent")
+
+    @app.post("/api/admin/lots/<int:lot_id>/candidate-notification/resolve")
+    @admin_required
+    def resolve_candidate_notification(lot_id: int) -> Response:
+        """Record the organizer's explicit manual check of an unknown delivery.
+
+        A not-sent decision permits a fresh deliberate send; neither decision
+        automatically sends a message or changes the selected candidate.
+        """
+        data = json_body()
+        outcome = data.get("outcome")
+        if outcome not in ("sent", "not_sent"):
+            abort(400, translate("error_candidate_notification_resolution_invalid"))
+        with write_transaction() as db:
+            active_lot(lot_id)
+            notification = latest_notification(db, lot_id)
+            if not notification:
+                abort(409, translate("error_candidate_notification_not_unknown"))
+            require_candidate(data, notification["candidate_id"])
+            if notification["state"] != "unknown":
+                abort(409, translate("error_candidate_notification_not_unknown"))
+            db.execute(
+                "UPDATE candidate_notifications SET state=?,updated=? WHERE lot_id=? AND candidate_id=?",
+                (outcome, time.time(), lot_id, notification["candidate_id"]),
+            )
         return jsonify(ok=True)
 
     return app

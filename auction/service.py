@@ -6,10 +6,12 @@ import argparse
 import fcntl
 import json
 import logging
+import math
 import os
 import queue
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -17,6 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -31,6 +34,10 @@ from auction.processes import free_port, stop, verify_public_url
 from auction.telegram import call
 
 ROOT = Path(__file__).resolve().parent.parent
+HEALTH_INTERVAL = 30.0
+HEALTH_FAILURE_LIMIT = 3
+WORKER_HEARTBEAT_MAX_AGE = 180.0
+WORKER_STARTUP_GRACE = 120.0
 
 
 @dataclass(frozen=True)
@@ -117,6 +124,7 @@ def service_environment(config: ServiceConfig) -> dict[str, str]:
         AUCTION_APP_URL="",
         AUCTION_DB=str(config.data_dir / "auction.sqlite3"),
         AUCTION_UPLOADS=str(config.data_dir / "photos"),
+        AUCTION_BACKUPS=str(config.data_dir.parent / "backups"),
         TELEGRAM_BOT_TOKEN=config.token,
         TELEGRAM_ADMIN_ID=str(config.admin_id),
     )
@@ -146,14 +154,21 @@ def read_output(
 
 
 def local_ready(port: int) -> bool:
-    """Verify that the loopback listener serves this package version outside demo/trial mode."""
+    """Check bounded loopback responses for this version and signed-identity mode.
+
+    Each of two local requests has a one-second socket timeout and a 16 KiB
+    response cap. Failures return False without exposing response contents.
+    """
     try:
         documents: list[JSONValue] = []
         for endpoint in ("version", "me"):
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/api/{endpoint}", timeout=1
             ) as response:
-                documents.append(cast(JSONValue, json.load(response)))
+                body = response.read(16_385)
+                if len(body) > 16_384:
+                    return False
+                documents.append(cast(JSONValue, json.loads(body)))
         version, profile = documents
         return (
             isinstance(version, dict)
@@ -164,6 +179,64 @@ def local_ready(port: int) -> bool:
         )
     except (OSError, ValueError, urllib.error.URLError):
         return False
+
+
+def worker_recent(database_path: Path, *, now: float | None = None) -> bool:
+    """Read a recent successful worker heartbeat without creating or mutating storage.
+
+    Missing, locked or malformed storage is unhealthy. A bounded read-only
+    connection prevents a health check from holding up the supervisor indefinitely.
+    Small forward clock skew is tolerated; timestamps far in the future are rejected.
+    """
+    now = time.time() if now is None else now
+    try:
+        with closing(
+            sqlite3.connect(database_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+        ) as db:
+            row = db.execute("SELECT completed FROM jobs WHERE name='worker_heartbeat'").fetchone()
+        if row is None or not isinstance(row[0], (int, float)):
+            return False
+        completed = float(row[0])
+        return math.isfinite(completed) and -30 <= now - completed <= WORKER_HEARTBEAT_MAX_AGE
+    except (OSError, sqlite3.Error):
+        return False
+
+
+@dataclass
+class HealthMonitor:
+    """Track consecutive bounded health failures independently of process liveness."""
+
+    worker_started: float
+    next_probe: float
+    failures: int = 0
+
+    def check(self, config: ServiceConfig, logger: logging.Logger, *, now: float) -> None:
+        """Probe at most once per interval; raise after three consecutive failed probes.
+
+        A newly launched worker has a grace period to complete its first batch.
+        Successful probes reset the counter. The caller restarts the stack after
+        this method raises, preserving the normal graceful shutdown path.
+        """
+        if now < self.next_probe:
+            return
+        self.next_probe = now + HEALTH_INTERVAL
+        web_ok = local_ready(config.port)
+        worker_ok = now - self.worker_started < WORKER_STARTUP_GRACE or worker_recent(
+            config.data_dir / "auction.sqlite3"
+        )
+        if web_ok and worker_ok:
+            self.failures = 0
+            return
+        self.failures += 1
+        logger.warning(
+            "Health probe failed (%s/%s, web=%s, worker=%s)",
+            self.failures,
+            HEALTH_FAILURE_LIMIT,
+            web_ok,
+            worker_ok,
+        )
+        if self.failures >= HEALTH_FAILURE_LIMIT:
+            raise RuntimeError("Repeated runtime health failures; restarting the stack.")
 
 
 def write_status(path: Path, config: ServiceConfig, url: str) -> None:
@@ -273,6 +346,8 @@ def run_service(config: ServiceConfig, logger: logging.Logger) -> int:
         )
         environment.update(AUCTION_BOT_POLL="1", AUCTION_APP_URL=url)
         worker = launch("worker", [sys.executable, "-m", "auction.worker"])
+        worker_started = time.monotonic()
+        health = HealthMonitor(worker_started, worker_started + HEALTH_INTERVAL)
         time.sleep(0.5)
         if worker.poll() is not None:
             raise RuntimeError("The notification worker exited during startup.")
@@ -288,6 +363,12 @@ def run_service(config: ServiceConfig, logger: logging.Logger) -> int:
                     ):
                         return 0
                     raise RuntimeError("A service component stopped; restarting the stack.")
+            # Expired APIs deliberately return 410 while the worker completes its
+            # final cleanup. Do not misclassify that transition as a web failure.
+            if time.time() < DELETE_AFTER:
+                health.check(config, logger, now=time.monotonic())
+            elif time.time() >= DELETE_AFTER + 120:
+                raise RuntimeError("Retention cleanup did not complete within its grace period.")
             time.sleep(2)
     except KeyboardInterrupt:
         logger.info("Service shutdown requested")

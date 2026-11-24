@@ -20,10 +20,10 @@ Run these commands from a clone containing the release tag:
 ```sh
 git fetch --tags
 AUCTION_DEPLOY_ROOT="$HOME/Library/Application Support/Friends Auction"
-AUCTION_RELEASE_DIR="$AUCTION_DEPLOY_ROOT/releases/v1.1.0"
+AUCTION_RELEASE_DIR="$AUCTION_DEPLOY_ROOT/releases/v1.2.0"
 mkdir -p "$AUCTION_RELEASE_DIR" "$AUCTION_DEPLOY_ROOT/bin"
 chmod 700 "$AUCTION_DEPLOY_ROOT"
-git archive v1.1.0 | tar -x -C "$AUCTION_RELEASE_DIR"
+git archive v1.2.0 | tar -x -C "$AUCTION_RELEASE_DIR"
 python3.12 -m venv "$AUCTION_RELEASE_DIR/.venv"
 "$AUCTION_RELEASE_DIR/.venv/bin/python" -m pip install -r "$AUCTION_RELEASE_DIR/requirements.txt"
 install -m 700 "$(command -v cloudflared)" "$AUCTION_DEPLOY_ROOT/bin/cloudflared"
@@ -66,6 +66,27 @@ are stored in `$AUCTION_DEPLOY_ROOT/logs/`; child output has tokens and HTTP URL
 redacted. The launch agent also captures otherwise unhandled startup output.
 Backups and retired deployment directories remain the operator's responsibility
 under the data retention policy.
+
+Version 1.2.0 adds a validated `source_commit` field. Populate the private
+release's `auction/build-info.json` with `version` and the full source commit
+when preparing it; a missing commit is reported as null. Container builds accept
+the public `AUCTION_SOURCE_COMMIT` build argument through Compose. Do not put
+secrets in build metadata or arguments. These declared values support diagnosis,
+not remote attestation.
+
+The supervisor checks HTTP readiness every 30 seconds and restarts after three
+consecutive failures. A worker heartbeat detects stalled background processing,
+with startup and cleanup grace periods. Graceful shutdown permits in-flight
+requests up to 30 seconds before escalation; the launch agent uses a 45-second
+exit timeout. `restart` waits for the old registration to disappear and retries
+only recognized transient bootstrap failures.
+
+Before switching release directories, stop the agent, create and verify a
+[managed storage snapshot](data-retention.md), and preserve the old plist. Write
+the new release-specific plist while the service is stopped, then bootstrap it
+and check packaged identity, HTTP readiness and fresh worker progress. Never
+overwrite the source or virtual environment of a running release. Existing
+1.1.0 plists must be regenerated to receive the new shutdown timeout.
 
 ## HTTPS access and availability
 

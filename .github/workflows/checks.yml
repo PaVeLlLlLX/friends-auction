@@ -25,6 +25,15 @@ jobs:
       - run: ruff format --check .
       - run: python -m mypy
       - run: python -m pytest -q
+      - name: Audit pinned runtime dependencies
+        run: pip-audit -r requirements.txt --format json --output pip-audit-runtime.json
+      - name: Preserve runtime dependency audit
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-audit-python-${{ matrix.python-version }}
+          path: pip-audit-runtime.json
+          if-no-files-found: warn
 
   frontend:
     runs-on: ubuntu-latest
@@ -48,6 +57,7 @@ jobs:
       AUCTION_HTTP_PORT: "18080"
       AUCTION_BOT_POLL: "0"
       AUCTION_APP_URL: ""
+      AUCTION_SOURCE_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Validate Compose configuration
@@ -57,11 +67,21 @@ jobs:
       - name: Check runtime isolation and write persistent data
         run: |
           curl --fail --silent http://127.0.0.1:18080/ > /dev/null
-          docker compose exec -T web python - <<'PY'
+          docker compose exec -T -e EXPECTED_SOURCE_COMMIT="$AUCTION_SOURCE_COMMIT" web python - <<'PY'
+          import json
           import os
           import sqlite3
+          import urllib.request
           from pathlib import Path
 
+          from auction import __version__
+
+          with urllib.request.urlopen('http://127.0.0.1:8080/api/version', timeout=3) as response:
+              identity = json.load(response)
+          build_info = json.loads(Path('/app/auction/build-info.json').read_text())
+          assert identity['version'] == __version__
+          assert identity['source_commit'] == os.environ['EXPECTED_SOURCE_COMMIT']
+          assert build_info['source_commit'] == identity['source_commit']
           assert os.getuid() == 10001
           assert os.statvfs('/app').f_flag & os.ST_RDONLY
           assert not any(Path(path).exists() for path in (

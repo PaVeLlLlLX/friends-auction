@@ -7,6 +7,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,7 +42,7 @@ def launch_agent(release_dir: Path, config_path: Path, *, allow_sleep: bool = Fa
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": 15,
-        "ExitTimeOut": 30,
+        "ExitTimeOut": 45,
         "ProcessType": "Background",
         "Umask": 0o077,
         "StandardOutPath": str(logs / "launchd-output.log"),
@@ -49,16 +50,86 @@ def launch_agent(release_dir: Path, config_path: Path, *, allow_sleep: bool = Fa
     }
 
 
+def launchctl(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run one bounded launchctl command and retain its original diagnostic text."""
+    return subprocess.run(
+        ["launchctl", *arguments], capture_output=True, text=True, check=False, timeout=10
+    )
+
+
+def show_failure(result: subprocess.CompletedProcess[str]) -> int:
+    """Print original command diagnostics and return its failure code."""
+    for output in (result.stdout, result.stderr):
+        if output:
+            print(output.rstrip(), file=sys.stderr)
+    return result.returncode
+
+
+def agent_present(target: str) -> bool | None:
+    """Distinguish a registered agent from a positively identified missing service.
+
+    Unexpected print failures remain unknown and retain their diagnostics; a
+    permission or domain error must not be mistaken for completed teardown.
+    """
+    result = launchctl(["print", target])
+    if result.returncode == 0:
+        return True
+    diagnostic = (result.stdout + result.stderr).lower()
+    if "could not find service" in diagnostic or "no such process" in diagnostic:
+        return False
+    show_failure(result)
+    return None
+
+
+def wait_absent(target: str, *, timeout: float = 20) -> bool:
+    """Wait for launchd registration to disappear, with a bounded poll interval."""
+    deadline = time.monotonic() + timeout
+    while True:
+        present = agent_present(target)
+        if present is False:
+            return True
+        if present is None:
+            return False
+        if time.monotonic() >= deadline:
+            print("The previous launch agent is still registered after shutdown.", file=sys.stderr)
+            return False
+        time.sleep(0.25)
+
+
 def control(action: str, plist: Path) -> int:
-    """Perform a scoped launchctl action; report its exit code without touching other agents."""
+    """Control one agent, waiting for teardown before bounded transient bootstrap retries.
+
+    Missing agents are safe to restart. Other bootout errors and non-transient
+    bootstrap errors are preserved. No unrelated launchd jobs are touched.
+    """
     domain = f"gui/{os.getuid()}"
     target = f"{domain}/{LABEL}"
-    if action in ("stop", "restart"):
-        stopped = subprocess.run(["launchctl", "bootout", target], check=False)
-        if action == "stop":
-            return stopped.returncode
-    started = subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=False)
-    return started.returncode
+    try:
+        if action in ("stop", "restart"):
+            stopped = launchctl(["bootout", target])
+            if stopped.returncode != 0 and agent_present(target) is not False:
+                return show_failure(stopped)
+            if not wait_absent(target):
+                return stopped.returncode or 1
+            if action == "stop":
+                return 0
+        for attempt in range(3):
+            started = launchctl(["bootstrap", domain, str(plist)])
+            if started.returncode == 0:
+                return 0
+            # launchd may briefly retain internal teardown state even after print
+            # reports absence. Retry only its known transient I/O/busy failure.
+            diagnostic = (started.stdout + started.stderr).lower()
+            transient = started.returncode in (5, 16) and (
+                "input/output error" in diagnostic or "resource busy" in diagnostic
+            )
+            if not transient or attempt == 2 or agent_present(target) is not False:
+                return show_failure(started)
+            time.sleep(0.5 * (attempt + 1))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"Unable to control the launch agent: {error}", file=sys.stderr)
+        return 1
+    return 1
 
 
 def main() -> int:

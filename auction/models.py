@@ -42,6 +42,7 @@ class LotRecord(TypedDict):
     fulfillment: str
     refused: str
     deleted: int
+    revision: int
 
 
 class Candidate(TypedDict):
@@ -69,6 +70,16 @@ class PersonalBid(TypedDict):
     created: float
     lot_id: int
     title: str
+    deleted: bool
+    status: Literal["active", "ended", "cancelled"]
+    own_leading: bool
+
+
+class CandidateNotification(TypedDict):
+    """Private delivery reservation; unknown requires explicit organizer resolution."""
+
+    candidate_id: int
+    state: Literal["sending", "sent", "unknown", "not_sent"]
 
 
 class PublicLot(TypedDict):
@@ -88,6 +99,7 @@ class PublicLot(TypedDict):
     has_bid: bool
     participation: bool
     watching: bool
+    revision: int
 
 
 class AdminLot(PublicLot):
@@ -111,9 +123,20 @@ def candidate_from_row(row: sqlite3.Row) -> Candidate:
     return cast(Candidate, dict(row))
 
 
-def personal_bid_from_row(row: sqlite3.Row) -> PersonalBid:
-    """Type the caller-filtered bid/lot query without adding participant profiles."""
-    return cast(PersonalBid, dict(row))
+def personal_bid_from_row(
+    row: sqlite3.Row, *, status: Literal["active", "ended", "cancelled"], own_leading: bool
+) -> PersonalBid:
+    """Project caller-owned history, excluding internal refusal IDs from the query."""
+    return PersonalBid(
+        id=row["id"],
+        amount=row["amount"],
+        created=row["created"],
+        lot_id=row["lot_id"],
+        title=row["title"],
+        deleted=bool(row["deleted"]),
+        status=status,
+        own_leading=own_leading,
+    )
 
 
 def bid_history_from_row(row: sqlite3.Row) -> BidHistoryEntry:

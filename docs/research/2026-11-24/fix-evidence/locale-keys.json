@@ -1,0 +1,25 @@
+{
+  "added": [
+    "candidate_notification_checked_not_sent",
+    "candidate_notification_checked_sent",
+    "candidate_notification_confirm_not_sent",
+    "candidate_notification_confirm_sent",
+    "candidate_notification_not_sent",
+    "candidate_notification_recipient",
+    "candidate_notification_sending",
+    "candidate_notification_title",
+    "candidate_notification_unknown",
+    "error_candidate_notification_not_unknown",
+    "error_candidate_notification_pending",
+    "error_candidate_notification_resolution_invalid",
+    "error_candidate_notification_unknown",
+    "error_client_update_required",
+    "error_lot_revision_changed",
+    "error_operation_id_required",
+    "error_operation_payload_changed",
+    "lot_publication_check",
+    "lot_publication_pending",
+    "lot_publication_unknown"
+  ],
+  "changed": ["candidate_notification_sent", "rules_privacy_description"]
+}

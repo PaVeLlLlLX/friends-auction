@@ -1,0 +1,8 @@
+{
+  "scope": "direct parser unit probe, no sockets, no live service, finite 65540-byte input",
+  "gunicorn": "26.2.0",
+  "chunk_size_line_bytes": 65540,
+  "accepted_chunk_size": 1,
+  "remaining_bytes": 0,
+  "limits": "does not demonstrate end-to-end Cloudflare reachability or memory exhaustion"
+}

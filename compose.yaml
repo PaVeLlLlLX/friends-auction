@@ -4,11 +4,14 @@ x-app: &app
   image: friends-auction:local
   build:
     context: .
+    args:
+      SOURCE_COMMIT: ${AUCTION_SOURCE_COMMIT:-}
   environment:
     TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
     TELEGRAM_ADMIN_ID: ${TELEGRAM_ADMIN_ID:?Set TELEGRAM_ADMIN_ID in .env}
     AUCTION_DB: /app/data/auction.sqlite3
     AUCTION_UPLOADS: /app/data/photos
+    AUCTION_BACKUPS: /app/data/backups
     AUCTION_DEMO: "0"
     AUCTION_TRIAL: "0"
     AUCTION_BOT_POLL: ${AUCTION_BOT_POLL:-0}

@@ -1,0 +1,19 @@
+{
+  "enter": {
+    "bidPosts": 0,
+    "amount": "0"
+  },
+  "zeroBidConfirm": "Подтвердить ставку 0 ₽?",
+  "zeroBid": {
+    "bidPosts": 1,
+    "price": "0 ₽"
+  },
+  "archiveStatus": 200,
+  "archivedHistory": "Audit lot\n24.11.2026, 14:56:39 · Вы лидируете\n0 ₽",
+  "archivedLink": "#/lot/1",
+  "archivedLinkResult": "Лот не найден",
+  "unknownCreateToast": "Ответ не получен. Действие могло сохраниться. Проверьте актуальное состояние перед повтором.",
+  "createdAfterLostResponse": 1,
+  "createdAfterManualRetry": 2,
+  "errors": []
+}

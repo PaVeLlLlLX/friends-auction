@@ -143,7 +143,7 @@ main {
   border-top: 1px solid var(--line);
   display: flex;
   justify-content: space-between;
-  color: #97a097;
+  color: var(--muted);
   font-size: 11px;
 }
 .bottom-nav {
@@ -182,7 +182,7 @@ main {
   display: inline-block;
   font-size: 12px;
   font-weight: 700;
-  color: #728579;
+  color: var(--muted);
   margin-bottom: 26px;
 }
 .detail-layout {
@@ -221,7 +221,7 @@ main {
 }
 .detail-description {
   line-height: 1.75;
-  color: #6c7b70;
+  color: var(--muted);
   font-size: 13px;
   white-space: pre-line;
 }
@@ -301,7 +301,7 @@ main {
 .hint {
   font-size: 11px;
   line-height: 1.6;
-  color: #859289;
+  color: var(--muted);
 }
 .toggle-row {
   display: flex;
@@ -330,7 +330,7 @@ main {
   font-size: 15px;
 }
 .panel p {
-  color: #78857b;
+  color: var(--muted);
   line-height: 1.65;
   font-size: 12px;
 }
@@ -339,7 +339,7 @@ main {
   padding: 65px 20px;
   background: #edf1e9;
   border-radius: 18px;
-  color: #708073;
+  color: var(--muted);
 }
 .empty strong {
   display: block;
@@ -364,7 +364,7 @@ main {
 }
 .list-item small {
   display: block;
-  color: #89958a;
+  color: var(--muted);
   margin-top: 5px;
 }
 .actions {
@@ -426,7 +426,7 @@ main {
 .loading {
   padding: 80px;
   text-align: center;
-  color: #8b978d;
+  color: var(--muted);
 }
 .demo-strip {
   padding: 9px;
@@ -441,7 +441,7 @@ main {
 }
 .explain {
   font-size: 13px;
-  color: #697b6d;
+  color: var(--muted);
   line-height: 1.8;
 }
 .explain h3 {
@@ -455,7 +455,7 @@ main {
   justify-content: space-between;
 }
 .required {
-  color: #ab745d;
+  color: #98543e;
 }
 @media (max-width: 1200px) {
   main {
@@ -535,6 +535,7 @@ main {
   --ink: #242726;
   --green: #343e3a;
   --line: #e2e4e0;
+  --muted: #526158;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 .topbar {
@@ -562,7 +563,7 @@ main {
 }
 .catalog-kicker {
   font-size: 10px;
-  color: #7d8980;
+  color: var(--muted);
   letter-spacing: 1.2px;
   text-transform: uppercase;
   font-weight: 750;
@@ -582,7 +583,7 @@ main {
 .catalog-heading > div > p:last-child {
   font-size: 13px;
   line-height: 1.6;
-  color: #7b847e;
+  color: var(--muted);
   margin: 12px 0 0;
 }
 .rules-link {
@@ -617,16 +618,16 @@ main {
 .auction-info small {
   font-size: 10px;
   font-weight: 600;
-  color: #87918a;
+  color: var(--muted);
 }
 .info-label {
   font-size: 10px;
-  color: #7a887f;
+  color: var(--muted);
   font-weight: 600;
 }
 .auction-info-note {
   margin-left: auto;
-  color: #7b897f;
+  color: var(--muted);
   font-size: 11px;
 }
 .section-head {
@@ -639,7 +640,7 @@ main {
   margin: 0;
 }
 .count {
-  color: #929a94;
+  color: var(--muted);
 }
 .grid {
   gap: 26px 22px;
@@ -660,7 +661,7 @@ main {
     sans-serif;
   letter-spacing: 0.3px;
   transform: none;
-  color: #a1aaa3;
+  color: var(--muted);
   opacity: 1;
 }
 .photo-label {
@@ -685,7 +686,7 @@ main {
 }
 .small-label {
   font-size: 10px;
-  color: #8b958e;
+  color: var(--muted);
   margin-bottom: 5px;
 }
 .price {
@@ -697,7 +698,7 @@ main {
 }
 .card-meta {
   font-size: 11px;
-  color: #8b958e;
+  color: var(--muted);
   margin: 13px 0 0;
 }
 .card-meta span {
@@ -752,7 +753,7 @@ main {
   letter-spacing: -1.2px;
 }
 .eyebrow {
-  color: #7c8b80;
+  color: var(--muted);
 }
 .eyebrow:before {
   background: #9baaa0;
@@ -893,7 +894,7 @@ main {
   align-items: center;
   gap: 6px;
   font-size: 11px;
-  color: #62766a;
+  color: var(--muted);
   font-weight: 650;
   white-space: nowrap;
 }
@@ -943,7 +944,7 @@ main {
 }
 .admin-history-heading > span {
   font-size: 10px;
-  color: #7c8880;
+  color: var(--muted);
   white-space: nowrap;
 }
 .admin-history-list {
@@ -974,7 +975,7 @@ main {
 .admin-history-person small {
   display: block;
   margin-top: 4px;
-  color: #7c8880;
+  color: var(--muted);
   font-size: 11px;
   line-height: 1.4;
 }
@@ -1027,4 +1028,13 @@ main {
 }
 .telegram-strip button {
   margin-left: 10px;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
 }

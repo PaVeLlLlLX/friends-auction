@@ -1,0 +1,47 @@
+{
+  "audit_date": "2026-11-24",
+  "source_commit": "45ccee95610328be1bdb23e5ae81325b6540f4d6",
+  "receipt_origin": "Copied from successful tool stdout of the two recorded commands; this file does not claim an additional execution.",
+  "reproduce_correctness": {
+    "command": ".venv/bin/python /tmp/friends-auction-audit-20261124/reproduce_correctness.py",
+    "exit_code": 0,
+    "python": "3.12.14",
+    "sqlite": "3.53.4",
+    "stale_terms": {
+      "edit_http": 200,
+      "stale_bid_http": 200,
+      "observed_title": "Бокалы",
+      "accepted_title": "Changed item",
+      "amount": 1000,
+      "expected_price": null
+    },
+    "retention_race": {
+      "worker_finished": true,
+      "users_after_cleanup_before_resume": 0,
+      "resumed_application_http": 200,
+      "users_written_after_expiry": 1,
+      "persisted_status": "pending",
+      "persisted_private_name": "Test"
+    },
+    "offer_refusal_race": {
+      "notify_http": 200,
+      "delivered_to_refused_user": 2,
+      "actual_current_candidate": 4
+    }
+  },
+  "verify_correctness_controls": {
+    "command": ".venv/bin/python /tmp/friends-auction-audit-20261124/verify_correctness_controls.py",
+    "exit_code": 0,
+    "revoke_while_bid_waits": { "http": 403, "bids": 0 },
+    "deadline_while_bid_waits": { "http": 409, "bids": 0 },
+    "unique_candidates": {
+      "initial": [
+        [4, 150],
+        [2, 100],
+        [3, 50]
+      ],
+      "after_refusals": [[2, 3], [3], []],
+      "preserved_bids": 4
+    }
+  }
+}

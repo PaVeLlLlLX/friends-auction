@@ -11,13 +11,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timezone
 from email.message import Message
 from pathlib import Path
+from threading import Event
 from typing import NoReturn
+from uuid import uuid4
 
 import pytest
-from flask import Flask
+from flask import Flask, Request
 from flask.testing import FlaskClient
 from PIL import Image
 from werkzeug.test import TestResponse
@@ -153,6 +156,7 @@ def create_lot(client: FlaskClient, start: int = 0, step: int = 50) -> int:
         "/api/admin/lots",
         headers=auth(1),
         data={
+            "operation_id": str(uuid4()),
             "title": sample("lot_title"),
             "description": sample("lot_description"),
             "condition": sample("lot_condition"),
@@ -185,12 +189,14 @@ def approve(client: FlaskClient, uid: int) -> None:
     )
 
 
-def bid(client: FlaskClient, lot: int, uid: int, amount: int, expected: int | None) -> TestResponse:
+def bid(
+    client: FlaskClient, lot: int, uid: int, amount: int, expected: int | None, revision: int = 1
+) -> TestResponse:
     """Submit an amount together with the price observed by the participant."""
     return client.post(
         f"/api/lots/{lot}/bid",
         headers=auth(uid),
-        json={"amount": amount, "expected_price": expected},
+        json={"amount": amount, "expected_price": expected, "expected_revision": revision},
     )
 
 
@@ -369,7 +375,9 @@ def test_bid_cannot_cross_deadline_during_request(
 
     monkeypatch.setattr("auction.app.time.time", clock)
     response = client.post(
-        f"/api/lots/{lot}/bid", headers=headers, json={"amount": 0, "expected_price": None}
+        f"/api/lots/{lot}/bid",
+        headers=headers,
+        json={"amount": 0, "expected_price": None, "expected_revision": 1},
     )
     assert response.status_code == 409
     db = connect(app.config["DB"])
@@ -397,7 +405,7 @@ def test_lot_creation_rechecks_deadline_after_preparation(
     response = client.post(
         "/api/admin/lots",
         headers=headers,
-        data={"title": "Test lot", "start_price": "0", "step": "1"},
+        data={"operation_id": str(uuid4()), "title": "Test lot", "start_price": "0", "step": "1"},
     )
     assert response.status_code == 409
     db = connect(app.config["DB"])
@@ -419,6 +427,7 @@ def test_photo_is_reencoded_and_rejects_fake_image(app: Flask, client: FlaskClie
         "/api/admin/lots",
         headers=auth(1),
         data={
+            "operation_id": str(uuid4()),
             "title": sample("photo_lot_title"),
             "start_price": "0",
             "step": "1",
@@ -441,6 +450,7 @@ def test_photo_is_reencoded_and_rejects_fake_image(app: Flask, client: FlaskClie
         "/api/admin/lots",
         headers=auth(1),
         data={
+            "operation_id": str(uuid4()),
             "title": sample("photo_lot_title"),
             "start_price": "0",
             "step": "1",
@@ -461,6 +471,7 @@ def test_large_valid_photo_is_accepted_with_form_limits(client: FlaskClient) -> 
         "/api/admin/lots",
         headers=auth(1),
         data={
+            "operation_id": str(uuid4()),
             "title": sample("photo_lot_title"),
             "start_price": "0",
             "step": "1",
@@ -492,6 +503,7 @@ def test_failed_photo_write_rolls_back_database_and_partial_file(
             "/api/admin/lots",
             headers=auth(1),
             data={
+                "operation_id": str(uuid4()),
                 "title": "Test lot",
                 "start_price": "0",
                 "step": "1",
@@ -504,6 +516,7 @@ def test_failed_photo_write_rolls_back_database_and_partial_file(
     try:
         assert db.execute("SELECT count(*) FROM lots").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM photos").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM lot_operations").fetchone()[0] == 0
     finally:
         db.close()
 
@@ -567,9 +580,9 @@ def test_edit_only_before_first_bid_and_fallback(
     assert client.post(f"/api/admin/lots/{lot}/edit", headers=auth(1), json=data).status_code == 200
     approve(client, 2)
     approve(client, 3)
-    assert bid(client, lot, 2, 0, None).status_code == 200
+    assert bid(client, lot, 2, 0, None, revision=2).status_code == 200
     assert client.post(f"/api/admin/lots/{lot}/edit", headers=auth(1), json=data).status_code == 409
-    assert bid(client, lot, 3, 50, 0).status_code == 200
+    assert bid(client, lot, 3, 50, 0, revision=2).status_code == 200
     app.config["END"] = time.time() - 1
     assert (
         client.post(
@@ -1123,3 +1136,559 @@ def test_existing_lots_gain_archive_flag_without_losing_bids(
         json_response(new_client.get(f"/api/admin/lots/{lot}", headers=auth(1)))["lot"]
     )
     assert archived["deleted"] is False
+
+
+@pytest.mark.parametrize("path", ["/api/application", "/api/me"])
+def test_expiry_cleanup_wins_before_delayed_account_write(
+    app: Flask, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Reject a previously admitted request when cleanup precedes its account write."""
+    before = time.time()
+    clock = [before]
+    app.config["DELETE_AFTER"] = before + 1
+    headers = auth(444)
+    admitted, resume = Event(), Event()
+
+    @app.before_request
+    def pause_admitted_request() -> None:
+        """Pause after the real admission hook, before the account write lock."""
+        admitted.set()
+        assert resume.wait(10)
+
+    def now() -> float:
+        """Provide a boundary clock without waiting for the actual retention date."""
+        return clock[0]
+
+    def submit() -> int:
+        """Issue the suspended request through its own Flask client context."""
+        with app.test_client() as session:
+            if path == "/api/me":
+                return session.get(path, headers=headers).status_code
+            return session.post(
+                path,
+                headers=headers,
+                json={"given_name": sample("given_name"), "family_name": sample("family_name")},
+            ).status_code
+
+    monkeypatch.setattr("auction.app.time.time", now)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(submit)
+        try:
+            assert admitted.wait(5)
+            clock[0] = before + 2
+            assert tick(app, clock[0], lambda *_: False) is True
+        finally:
+            resume.set()
+        assert future.result(timeout=5) == 410
+    with closing(connect(app.config["DB"])) as db:
+        for table in ("users", "jobs", "lot_operations", "candidate_notifications"):
+            assert db.execute("SELECT count(*) FROM " + table).fetchone()[0] == 0
+
+
+def test_expiry_cleanup_waits_for_earlier_account_transaction(
+    app: Flask, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Allow an earlier write to finish, then remove it before final cleanup returns."""
+    before = time.time()
+    clock = [before]
+    app.config["DELETE_AFTER"] = before + 1
+    headers = auth(445)
+    writing, resume = Event(), Event()
+
+    def now() -> float:
+        """Advance the synthetic clock only after the account lock is held."""
+        return clock[0]
+
+    def observed_connect(path: str | os.PathLike[str]) -> sqlite3.Connection:
+        """Observe a real request transaction without changing its SQL statements."""
+        db = connect(path)
+
+        def trace(statement: str) -> None:
+            """Pause the insert while its write transaction blocks cleanup."""
+            if statement.startswith("INSERT INTO users"):
+                writing.set()
+                assert resume.wait(10)
+
+        db.set_trace_callback(trace)
+        return db
+
+    def submit() -> int:
+        """Create a synthetic account through a separate request context."""
+        with app.test_client() as session:
+            return session.get("/api/me", headers=headers).status_code
+
+    monkeypatch.setattr("auction.app.time.time", now)
+    monkeypatch.setattr("auction.app.connect", observed_connect)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        request_future = pool.submit(submit)
+        assert writing.wait(5)
+        clock[0] = before + 2
+        cleanup_future = pool.submit(tick, app, clock[0], lambda *_: False)
+        resume.set()
+        assert request_future.result(timeout=5) == 200
+        assert cleanup_future.result(timeout=5) is True
+    with closing(connect(app.config["DB"])) as db:
+        assert db.execute("SELECT count(*) FROM users").fetchone()[0] == 0
+
+
+def test_expiry_blocks_application_after_account_refresh_completed(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recheck expiry in the application transaction after an earlier account refresh."""
+    before = time.time()
+    clock = [before]
+    app.config["DELETE_AFTER"] = before + 1
+    headers = auth(446)
+    assert client.get("/api/me", headers=headers).status_code == 200
+    parsing, resume = Event(), Event()
+    original = Request.get_json
+
+    def now() -> float:
+        """Advance the boundary after account refresh has committed."""
+        return clock[0]
+
+    def delayed_json(
+        request: Request, force: bool = False, silent: bool = False, cache: bool = True
+    ) -> JSONValue:
+        """Suspend ordinary JSON parsing between account refresh and the later write."""
+        value: JSONValue = original(request, force=force, silent=silent, cache=cache)
+        parsing.set()
+        assert resume.wait(10)
+        return value
+
+    def submit() -> int:
+        """Submit a new application through its own request connection."""
+        with app.test_client() as session:
+            return session.post(
+                "/api/application",
+                headers=headers,
+                json={"given_name": sample("given_name"), "family_name": sample("family_name")},
+            ).status_code
+
+    monkeypatch.setattr("auction.app.time.time", now)
+    monkeypatch.setattr(Request, "get_json", delayed_json)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(submit)
+        try:
+            assert parsing.wait(5)
+            clock[0] = before + 2
+            assert tick(app, clock[0], lambda *_: False) is True
+        finally:
+            resume.set()
+        assert future.result(timeout=5) == 410
+    with closing(connect(app.config["DB"])) as db:
+        assert db.execute("SELECT count(*) FROM users").fetchone()[0] == 0
+
+
+def test_revision_rejects_changed_first_bid_terms(client: FlaskClient) -> None:
+    """Bind first-bid confirmation to the exact observed revision, including text edits."""
+    lot = create_lot(client)
+    approve(client, 2)
+    assert (
+        client.post(
+            f"/api/lots/{lot}/bid",
+            headers=auth(2),
+            json={"amount": 0, "expected_price": None},
+        ).status_code
+        == 409
+    )
+    data = {
+        "title": sample("edited_lot_title"),
+        "description": sample("lot_description"),
+        "condition": sample("edited_lot_condition"),
+        "start_price": 0,
+        "step": 50,
+    }
+    assert client.post(f"/api/admin/lots/{lot}/edit", headers=auth(1), json=data).status_code == 200
+    assert bid(client, lot, 2, 0, None, revision=1).status_code == 409
+    response = bid(client, lot, 2, 0, None, revision=2)
+    assert response.status_code == 200
+    assert json_object(json_response(response)["lot"])["revision"] == 2
+
+
+def test_revision_edit_and_first_bid_are_serialized(app: Flask, client: FlaskClient) -> None:
+    """Accept either the original bid or the edit, never an unconfirmed changed lot."""
+    lot = create_lot(client)
+    approve(client, 2)
+    data = {
+        "title": sample("edited_lot_title"),
+        "description": "",
+        "condition": "",
+        "start_price": 0,
+        "step": 50,
+    }
+
+    def mutate(edit: bool) -> int:
+        """Compete for the same lot through independent request connections."""
+        with app.test_client() as session:
+            if edit:
+                return session.post(
+                    f"/api/admin/lots/{lot}/edit", headers=auth(1), json=data
+                ).status_code
+            return bid(session, lot, 2, 0, None, revision=1).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        edited, accepted = pool.map(mutate, [True, False])
+    assert (edited, accepted) in ((200, 409), (409, 200))
+
+
+@pytest.mark.parametrize("with_photo", [False, True])
+def test_create_operation_is_idempotent_under_concurrent_retries(
+    app: Flask, with_photo: bool
+) -> None:
+    """Keep one lot, receipt and photo set when the same operation is retried."""
+    operation_id = str(uuid4())
+    image = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(image, "JPEG")
+    photo_bytes = image.getvalue()
+
+    def submit(_: int) -> int:
+        """Reconstruct identical multipart bodies without reusing consumed streams."""
+        data: dict[str, str | tuple[io.BytesIO, str]] = {
+            "operation_id": operation_id,
+            "title": sample("lot_title"),
+            "start_price": "0",
+            "step": "50",
+        }
+        if with_photo:
+            data["photos"] = (io.BytesIO(photo_bytes), "input.jpg")
+        with app.test_client() as session:
+            result = session.post("/api/admin/lots", headers=auth(1), data=data)
+            assert result.status_code == 201
+            return json_integer(json_object(json_response(result)["lot"])["id"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, retried = pool.map(submit, range(2))
+    assert first == retried
+    app.config["END"] = time.time() - 1
+    assert submit(2) == first
+    with closing(connect(app.config["DB"])) as db:
+        assert db.execute("SELECT count(*) FROM lots").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM lot_operations").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM photos").fetchone()[0] == int(with_photo)
+    assert len(list(Path(app.config["UPLOADS"]).glob("*.jpg"))) == int(with_photo)
+
+
+def test_create_operation_rejects_uuid_reuse_with_changed_content(client: FlaskClient) -> None:
+    """Reject a different logical payload instead of silently duplicating a UUID."""
+    data = {
+        "operation_id": str(uuid4()),
+        "title": sample("lot_title"),
+        "start_price": "0",
+        "step": "50",
+    }
+    assert client.post("/api/admin/lots", headers=auth(1), data=data).status_code == 201
+    data["title"] = sample("edited_lot_title")
+    assert client.post("/api/admin/lots", headers=auth(1), data=data).status_code == 409
+    for invalid in ("", "not-a-uuid"):
+        data["operation_id"] = invalid
+        assert client.post("/api/admin/lots", headers=auth(1), data=data).status_code == 400
+
+
+def prepare_fallback(app: Flask, client: FlaskClient) -> int:
+    """Create a closed lot whose original winner has explicitly declined."""
+    lot = create_lot(client)
+    approve(client, 2)
+    approve(client, 3)
+    assert bid(client, lot, 2, 0, None).status_code == 200
+    assert bid(client, lot, 3, 50, 0).status_code == 200
+    app.config["END"] = time.time() - 1
+    assert (
+        client.post(
+            f"/api/admin/lots/{lot}",
+            headers=auth(1),
+            json={"action": "refuse", "expected_candidate_id": 3},
+        ).status_code
+        == 200
+    )
+    return lot
+
+
+def test_candidate_send_reservation_blocks_concurrent_changes(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep the candidate stable during delivery without holding the global DB lock."""
+    lot = prepare_fallback(app, client)
+    sending, resume = Event(), Event()
+    delivered: list[int] = []
+
+    def sender(token: str, user_id: int, message: str) -> bool:
+        """Pause the simulated external effect so other API requests can compete."""
+        sending.set()
+        assert resume.wait(10)
+        delivered.append(user_id)
+        return True
+
+    def notify() -> int:
+        """Start one offer in an independent request context."""
+        with app.test_client() as session:
+            return session.post(
+                f"/api/admin/lots/{lot}/notify-candidate",
+                headers=auth(1),
+                json={"expected_candidate_id": 2},
+            ).status_code
+
+    monkeypatch.setattr("auction.worker.send_message", sender)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(notify)
+        try:
+            assert sending.wait(5)
+            for action in ("refuse", "cancel"):
+                assert (
+                    client.post(
+                        f"/api/admin/lots/{lot}",
+                        headers=auth(1),
+                        json={"action": action, "expected_candidate_id": 2},
+                    ).status_code
+                    == 409
+                )
+            assert (
+                client.post(
+                    f"/api/admin/lots/{lot}/delete", headers=auth(1), json={"expected_bid_count": 2}
+                ).status_code
+                == 409
+            )
+            assert notify() == 409
+            assert client.get("/api/me", headers=auth(2)).status_code == 200
+        finally:
+            resume.set()
+        assert future.result(timeout=5) == 200
+    assert notify() == 200 and delivered == [2]
+    state = json_response(client.get(f"/api/admin/lots/{lot}", headers=auth(1)))[
+        "candidate_notification"
+    ]
+    assert json_object(state) == {"candidate_id": 2, "state": "sent"}
+
+
+def test_unknown_candidate_send_requires_manual_reconciliation(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preserve ambiguity, block blind retries, and permit only explicit resolution."""
+    lot = prepare_fallback(app, client)
+    attempts: list[int] = []
+
+    def uncertain(token: str, user_id: int, message: str) -> bool:
+        """Simulate an unacknowledged send, which may already have reached Telegram."""
+        attempts.append(user_id)
+        return False
+
+    monkeypatch.setattr("auction.worker.send_message", uncertain)
+    endpoint = f"/api/admin/lots/{lot}/notify-candidate"
+    for _ in range(2):
+        assert (
+            client.post(endpoint, headers=auth(1), json={"expected_candidate_id": 2}).status_code
+            == 409
+        )
+    assert attempts == [2]
+    assert (
+        client.post(
+            f"/api/admin/lots/{lot}", headers=auth(1), json={"action": "cancel"}
+        ).status_code
+        == 409
+    )
+    assert (
+        client.post(
+            f"/api/admin/lots/{lot}/delete", headers=auth(1), json={"expected_bid_count": 2}
+        ).status_code
+        == 409
+    )
+    resolve = f"/api/admin/lots/{lot}/candidate-notification/resolve"
+    assert (
+        client.post(
+            resolve, headers=auth(2), json={"expected_candidate_id": 2, "outcome": "sent"}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            resolve, headers=auth(1), json={"expected_candidate_id": 3, "outcome": "sent"}
+        ).status_code
+        == 409
+    )
+    assert (
+        client.post(
+            resolve, headers=auth(1), json={"expected_candidate_id": 2, "outcome": "invalid"}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            resolve, headers=auth(1), json={"expected_candidate_id": 2, "outcome": "not_sent"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(endpoint, headers=auth(1), json={"expected_candidate_id": 2}).status_code == 409
+    )
+    assert attempts == [2, 2]
+    assert (
+        client.post(
+            resolve, headers=auth(1), json={"expected_candidate_id": 2, "outcome": "sent"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(endpoint, headers=auth(1), json={"expected_candidate_id": 2}).status_code == 200
+    )
+    assert attempts == [2, 2]
+
+
+@pytest.mark.parametrize("action", ["refuse", "cancel", "delete"])
+def test_candidate_change_before_send_rejects_stale_offer(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    """Reject an outdated offer when candidate change acquires the write lock first."""
+    lot = prepare_fallback(app, client)
+    attempts: list[int] = []
+
+    def forbidden(token: str, user_id: int, message: str) -> NoReturn:
+        """Ensure a stale operation never crosses the simulated network boundary."""
+        attempts.append(user_id)
+        raise AssertionError("Unexpected Telegram send")
+
+    monkeypatch.setattr("auction.worker.send_message", forbidden)
+    if action == "delete":
+        changed = client.post(
+            f"/api/admin/lots/{lot}/delete", headers=auth(1), json={"expected_bid_count": 2}
+        )
+    else:
+        changed = client.post(
+            f"/api/admin/lots/{lot}",
+            headers=auth(1),
+            json={"action": action, "expected_candidate_id": 2},
+        )
+    assert changed.status_code == 200
+    sent = client.post(
+        f"/api/admin/lots/{lot}/notify-candidate",
+        headers=auth(1),
+        json={"expected_candidate_id": 2},
+    )
+    assert sent.status_code == (404 if action == "delete" else 409)
+    assert attempts == []
+
+
+def test_revision_migration_preserves_lots_and_bids(app: Flask, client: FlaskClient) -> None:
+    """Add revision to the previous schema without dropping auction history."""
+    lot = create_lot(client)
+    approve(client, 2)
+    assert bid(client, lot, 2, 0, None).status_code == 200
+    with closing(connect(app.config["DB"])) as db:
+        db.execute("ALTER TABLE lots DROP COLUMN revision")
+    migrated = create_app(app.config)
+    result = json_object(json_response(migrated.test_client().get(f"/api/lots/{lot}"))["lot"])
+    assert result["revision"] == 1 and result["count"] == 1 and result["price"] == 0
+
+
+def test_stale_candidate_send_lease_recovers_without_automatic_retry(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Turn an abandoned sending reservation into unknown after its bounded lease."""
+    lot = prepare_fallback(app, client)
+    attempts: list[int] = []
+    with closing(connect(app.config["DB"])) as db:
+        db.execute(
+            "INSERT INTO candidate_notifications(lot_id,candidate_id,attempt_id,state,updated) VALUES(?,2,'old-attempt','sending',?)",
+            (lot, time.time() - 121),
+        )
+
+    def forbidden(token: str, user_id: int, message: str) -> NoReturn:
+        """Fail if merely reading or retrying an unknown offer attempts delivery."""
+        attempts.append(user_id)
+        raise AssertionError("Unexpected Telegram send")
+
+    monkeypatch.setattr("auction.worker.send_message", forbidden)
+    result = json_response(client.get(f"/api/admin/lots/{lot}", headers=auth(1)))
+    assert json_object(result["candidate_notification"])["state"] == "unknown"
+    assert (
+        client.post(
+            f"/api/admin/lots/{lot}/notify-candidate",
+            headers=auth(1),
+            json={"expected_candidate_id": 2},
+        ).status_code
+        == 409
+    )
+    assert attempts == []
+    app.config["DELETE_AFTER"] = time.time() - 1
+    assert tick(app) is True
+    with closing(connect(app.config["DB"])) as db:
+        for table in ("candidate_notifications", "lot_operations", "users", "lots", "jobs"):
+            assert db.execute("SELECT count(*) FROM " + table).fetchone()[0] == 0
+
+
+def test_personal_history_carries_safe_archived_status(app: Flask, client: FlaskClient) -> None:
+    """Report the caller's archived status without exposing refusal IDs or other names."""
+    lot = prepare_fallback(app, client)
+    mine = json_objects(json_response(client.get("/api/my-bids", headers=auth(2)))["bids"])[0]
+    assert mine["status"] == "ended" and mine["own_leading"] is True
+    assert (
+        client.post(
+            f"/api/admin/lots/{lot}/delete", headers=auth(1), json={"expected_bid_count": 2}
+        ).status_code
+        == 200
+    )
+    mine = json_objects(json_response(client.get("/api/my-bids", headers=auth(2)))["bids"])[0]
+    assert (
+        mine["deleted"] is True and mine["status"] == "cancelled" and mine["own_leading"] is False
+    )
+    assert set(mine) == {
+        "id",
+        "amount",
+        "created",
+        "lot_id",
+        "title",
+        "deleted",
+        "status",
+        "own_leading",
+    }
+
+
+def test_worker_heartbeat_tracks_progress_and_stops_after_expiry(app: Flask) -> None:
+    """Record health progress while running and leave no receipt after final cleanup."""
+    assert tick(app) is None
+    with closing(connect(app.config["DB"])) as db:
+        assert db.execute("SELECT completed FROM jobs WHERE name='worker_heartbeat'").fetchone()
+    app.config["DELETE_AFTER"] = time.time() - 1
+    assert tick(app) is True
+    from auction.worker import record_heartbeat
+
+    record_heartbeat(app)
+    with closing(connect(app.config["DB"])) as db:
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_public_photo_limits_are_separate_from_admin_api(
+    app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bound image requests without allowing public flooding to exhaust admin buckets."""
+    monkeypatch.setattr("auction.app.time.monotonic", lambda: 600.0)
+    lot = create_lot(client)
+    image = Path(app.config["UPLOADS"]) / "public.jpg"
+    Image.new("RGB", (2, 2), "red").save(image, "JPEG")
+    with closing(connect(app.config["DB"])) as db:
+        db.execute(
+            "INSERT INTO photos(id,lot_id,filename) VALUES('public-photo',?,'public.jpg')", (lot,)
+        )
+    for _ in range(600):
+        assert (
+            client.get(
+                "/photos/public-photo", headers={"X-Forwarded-For": str(uuid4())}
+            ).status_code
+            == 200
+        )
+    rejected = client.get("/photos/public-photo")
+    assert rejected.status_code == 429 and rejected.headers["Retry-After"] == "60"
+    assert client.get("/api/admin/lots", headers=auth(1)).status_code == 200
+    app.config["CLOUDFLARE_PROXY"] = True
+    assert (
+        client.get("/photos/public-photo", headers={"CF-Connecting-IP": "192.0.2.11"}).status_code
+        == 200
+    )
+    assert (
+        client.get("/photos/public-photo", headers={"CF-Connecting-IP": "192.0.2.12"}).status_code
+        == 200
+    )
+    app.config["CLOUDFLARE_PROXY"] = False
+    assert (
+        client.get("/photos/public-photo", headers={"CF-Connecting-IP": "192.0.2.13"}).status_code
+        == 429
+    )

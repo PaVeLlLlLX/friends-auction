@@ -36,6 +36,7 @@ from auction.telegram import call
 ROOT = Path(__file__).resolve().parent.parent
 HEALTH_INTERVAL = 30.0
 HEALTH_FAILURE_LIMIT = 3
+PUBLIC_HEALTH_INTERVAL = 60.0
 WORKER_HEARTBEAT_MAX_AGE = 180.0
 WORKER_STARTUP_GRACE = 120.0
 
@@ -209,13 +210,19 @@ class HealthMonitor:
     worker_started: float
     next_probe: float
     failures: int = 0
+    public_url: str = ""
+    next_public_probe: float = 0
+    public_failures: int = 0
 
     def check(self, config: ServiceConfig, logger: logging.Logger, *, now: float) -> None:
         """Probe at most once per interval; raise after three consecutive failed probes.
 
         A newly launched worker has a grace period to complete its first batch.
-        Successful probes reset the counter. The caller restarts the stack after
-        this method raises, preserving the normal graceful shutdown path.
+        Local and public failure streaks reset independently on recovery. Public
+        HTTPS is checked once per minute while local HTTP is ready; a live but
+        disconnected tunnel must not remain healthy solely because its PID exists.
+        The caller restarts the stack after this method raises, preserving graceful
+        shutdown and refreshing the bot's URL during startup.
         """
         if now < self.next_probe:
             return
@@ -226,17 +233,31 @@ class HealthMonitor:
         )
         if web_ok and worker_ok:
             self.failures = 0
+        else:
+            self.failures += 1
+            logger.warning(
+                "Health probe failed (%s/%s, web=%s, worker=%s)",
+                self.failures,
+                HEALTH_FAILURE_LIMIT,
+                web_ok,
+                worker_ok,
+            )
+            if self.failures >= HEALTH_FAILURE_LIMIT:
+                raise RuntimeError("Repeated runtime health failures; restarting the stack.")
+        if not web_ok or not self.public_url or now < self.next_public_probe:
             return
-        self.failures += 1
+        self.next_public_probe = now + PUBLIC_HEALTH_INTERVAL
+        if verify_public_url(self.public_url, quick_only=False):
+            self.public_failures = 0
+            return
+        self.public_failures += 1
         logger.warning(
-            "Health probe failed (%s/%s, web=%s, worker=%s)",
-            self.failures,
+            "Public HTTPS health probe failed (%s/%s)",
+            self.public_failures,
             HEALTH_FAILURE_LIMIT,
-            web_ok,
-            worker_ok,
         )
-        if self.failures >= HEALTH_FAILURE_LIMIT:
-            raise RuntimeError("Repeated runtime health failures; restarting the stack.")
+        if self.public_failures >= HEALTH_FAILURE_LIMIT:
+            raise RuntimeError("Repeated public HTTPS failures; recreating the service tunnel.")
 
 
 def write_status(path: Path, config: ServiceConfig, url: str) -> None:
@@ -347,7 +368,12 @@ def run_service(config: ServiceConfig, logger: logging.Logger) -> int:
         environment.update(AUCTION_BOT_POLL="1", AUCTION_APP_URL=url)
         worker = launch("worker", [sys.executable, "-m", "auction.worker"])
         worker_started = time.monotonic()
-        health = HealthMonitor(worker_started, worker_started + HEALTH_INTERVAL)
+        health = HealthMonitor(
+            worker_started,
+            worker_started + HEALTH_INTERVAL,
+            public_url=url,
+            next_public_probe=worker_started + PUBLIC_HEALTH_INTERVAL,
+        )
         time.sleep(0.5)
         if worker.poll() is not None:
             raise RuntimeError("The notification worker exited during startup.")

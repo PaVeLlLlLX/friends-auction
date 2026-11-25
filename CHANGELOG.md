@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.1] - 2026-11-26
+
+### Fixed
+
+- Continue checking the public HTTPS catalog after startup, independently of local HTTP and worker health.
+- Recreate the supervised stack and refresh the bot menu after three consecutive external failures; a transient recovered failure resets the streak.
+- Avoid redundant external probes while the local web process is unavailable; preserve graceful shutdown and retention behavior.
+
 ## [1.2.0] - 2026-11-24
 
 ### Fixed

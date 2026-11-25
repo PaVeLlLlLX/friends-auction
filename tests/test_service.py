@@ -208,6 +208,62 @@ def test_health_monitor_waits_for_first_worker_batch(
         monitor.check(config, logger, now=180)
 
 
+def test_public_monitor_recovers_then_restarts_a_live_but_unreachable_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Detect persistent external failure while HTTP and worker remain locally healthy."""
+    config = service.ServiceConfig("fake-test-token", 1, tmp_path / "data", Path("/cloudflared"))
+    monkeypatch.setattr(service, "local_ready", lambda port: True)
+    monkeypatch.setattr(service, "worker_recent", lambda path: True)
+    replies = iter((False, False, True, False, False, False))
+    calls: list[str] = []
+    origin = "https://auction.example"
+
+    def public_ready(url: str, *, quick_only: bool = True) -> bool:
+        """Return finite external outcomes without using a real tunnel or DNS."""
+        assert quick_only is False
+        calls.append(url)
+        return next(replies)
+
+    monkeypatch.setattr(service, "verify_public_url", public_ready)
+    monitor = service.HealthMonitor(0, 30, public_url=origin, next_public_probe=60)
+    logger = logging.getLogger("public-health-test")
+    monitor.check(config, logger, now=30)
+    assert calls == []
+    for now, failures in ((60, 1), (90, 1), (120, 2), (180, 0), (240, 1), (300, 2)):
+        monitor.check(config, logger, now=now)
+        assert monitor.public_failures == failures
+        assert monitor.failures == 0
+    with pytest.raises(RuntimeError, match="Repeated public HTTPS failures"):
+        monitor.check(config, logger, now=360)
+    assert calls == [origin] * 6
+    assert origin not in caplog.text and config.token not in caplog.text
+
+
+def test_public_monitor_does_not_probe_while_local_http_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Avoid redundant external work while the local health streak owns recovery."""
+    config = service.ServiceConfig("fake-test-token", 1, tmp_path / "data", Path("/cloudflared"))
+    monkeypatch.setattr(service, "local_ready", lambda port: False)
+    monkeypatch.setattr(service, "worker_recent", lambda path: True)
+    calls: list[str] = []
+
+    def public_ready(url: str, *, quick_only: bool = True) -> bool:
+        """Record any unintended external probe without opening a connection."""
+        calls.append(url)
+        return False
+
+    monkeypatch.setattr(service, "verify_public_url", public_ready)
+    monitor = service.HealthMonitor(0, 30, public_url="https://auction.example")
+    logger = logging.getLogger("unavailable-local-health-test")
+    monitor.check(config, logger, now=30)
+    monitor.check(config, logger, now=60)
+    with pytest.raises(RuntimeError, match="Repeated runtime health failures"):
+        monitor.check(config, logger, now=90)
+    assert calls == [] and monitor.public_failures == 0
+
+
 class ShutdownProcess(subprocess.Popen[str]):
     """Represent a child deterministically without constructing an operating-system process."""
 
